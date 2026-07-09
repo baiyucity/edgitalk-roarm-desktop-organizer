@@ -71,12 +71,15 @@ RoArm-M2-S1 Robotic Arm
 │  ├─ vision_ipc_tx.c
 │  └─ vision_ipc_tx.h
 │
-└─ M55-libraries/
-   ├─ Common/
-   │  ├─ board/
-   │  └─ deepcraft_ai/
-   ├─ M33_Config/
-   └─ M55_Config/
+├─ M33_Config/
+├─ M55_Config/
+├─ include/
+├─ model/
+├─ ports/
+├─ src/
+├─ .gitignore
+├─ LICENSE
+└─ README.md
 ```
 
 ## Main Components
