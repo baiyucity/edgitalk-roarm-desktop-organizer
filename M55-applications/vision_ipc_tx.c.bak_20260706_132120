@@ -1,0 +1,188 @@
+/*
+ * Copyright (c) 2006-2021, RT-Thread Development Team
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Change Logs:
+ * Date           Author       Notes
+ * 2026-07-01     DELL       the first version
+ */
+
+#include <rtthread.h>
+#include <rtdevice.h>
+#include <string.h>
+#include <stdint.h>
+
+#include "vision_ipc_tx.h"
+
+#ifdef BSP_USING_IPC
+#include "drv_ipc.h"
+#endif
+
+#define VISION_IPC_MSG_PEN_COORD     0x5501U
+#define VISION_IPC_SEND_INTERVAL_MS  10000U
+
+#ifdef BSP_USING_IPC
+
+static rt_device_t g_vision_ipc_dev = RT_NULL;
+static rt_uint32_t g_vision_ipc_seq = 0;
+static rt_tick_t g_vision_last_send_tick = 0;
+
+static int vision_ipc_open_once(void)
+{
+    if (g_vision_ipc_dev != RT_NULL)
+    {
+        return RT_EOK;
+    }
+
+    g_vision_ipc_dev = edge_ipc_device_find();
+
+    if (g_vision_ipc_dev == RT_NULL)
+    {
+        if (edge_ipc_device_register() != RT_EOK)
+        {
+            rt_kprintf("[M55 IPC] register failed\r\n");
+            return -RT_ERROR;
+        }
+
+        g_vision_ipc_dev = edge_ipc_device_find();
+        if (g_vision_ipc_dev == RT_NULL)
+        {
+            rt_kprintf("[M55 IPC] device not found\r\n");
+            return -RT_ERROR;
+        }
+    }
+
+    if (rt_device_open(g_vision_ipc_dev, RT_DEVICE_FLAG_RDWR) != RT_EOK)
+    {
+        rt_kprintf("[M55 IPC] open failed\r\n");
+        g_vision_ipc_dev = RT_NULL;
+        return -RT_ERROR;
+    }
+
+    rt_kprintf("[M55 IPC] opened\r\n");
+    return RT_EOK;
+}
+
+static rt_uint16_t clamp_u16_from_i16(int16_t v)
+{
+    if (v < 0)
+    {
+        return 0;
+    }
+
+    return (rt_uint16_t)v;
+}
+
+#endif
+
+void vision_ipc_try_send_result(const uvc_ai_result_t *result)
+{
+#ifdef BSP_USING_IPC
+    edge_rc_frame_t frame;
+    rt_tick_t now;
+    rt_tick_t interval_ticks;
+    int16_t x1, y1, x2, y2;
+    rt_uint16_t cx, cy;
+    rt_uint16_t score_x1000;
+
+    if (result == RT_NULL)
+    {
+        return;
+    }
+
+    if ((!result->valid) || (result->count == 0U))
+    {
+        return;
+    }
+
+    now = rt_tick_get();
+    interval_ticks = (VISION_IPC_SEND_INTERVAL_MS * RT_TICK_PER_SECOND) / 1000U;
+
+    if ((g_vision_last_send_tick != 0U) &&
+        ((now - g_vision_last_send_tick) < interval_ticks))
+    {
+        return;
+    }
+
+    if (vision_ipc_open_once() != RT_EOK)
+    {
+        return;
+    }
+
+    x1 = result->bbox_int16[0];
+    y1 = result->bbox_int16[1];
+    x2 = result->bbox_int16[2];
+    y2 = result->bbox_int16[3];
+
+    if (x1 > x2)
+    {
+        int16_t t = x1;
+        x1 = x2;
+        x2 = t;
+    }
+
+    if (y1 > y2)
+    {
+        int16_t t = y1;
+        y1 = y2;
+        y2 = t;
+    }
+
+    cx = clamp_u16_from_i16((int16_t)((x1 + x2) / 2));
+    cy = clamp_u16_from_i16((int16_t)((y1 + y2) / 2));
+
+    if (result->conf[0] <= 0.0f)
+    {
+        score_x1000 = 0;
+    }
+    else if (result->conf[0] >= 1.0f)
+    {
+        score_x1000 = 1000;
+    }
+    else
+    {
+        score_x1000 = (rt_uint16_t)(result->conf[0] * 1000.0f);
+    }
+
+    memset(&frame, 0, sizeof(frame));
+
+    /*
+     * 当前 IPC 公共头里没有单独的 RC_ROLE_M55，
+     * 只有 RC_ROLE_M55_ECHO，所以这里先复用它表示 M55 发来的帧。
+     */
+    frame.role = RC_ROLE_M55_ECHO;
+    frame.seq = ++g_vision_ipc_seq;
+
+    frame.channel[0] = VISION_IPC_MSG_PEN_COORD;
+    frame.channel[1] = cx;
+    frame.channel[2] = cy;
+    frame.channel[3] = clamp_u16_from_i16(x1);
+    frame.channel[4] = clamp_u16_from_i16(y1);
+    frame.channel[5] = clamp_u16_from_i16(x2);
+    frame.channel[6] = clamp_u16_from_i16(y2);
+    frame.channel[7] = score_x1000;
+
+    if (rt_device_write(g_vision_ipc_dev, 0, &frame, 1) == 1)
+    {
+        g_vision_last_send_tick = now;
+
+        rt_kprintf("[M55->M33] pen cx=%u cy=%u bbox=[%u,%u,%u,%u] score=%u seq=%lu\r\n",
+                   frame.channel[1],
+                   frame.channel[2],
+                   frame.channel[3],
+                   frame.channel[4],
+                   frame.channel[5],
+                   frame.channel[6],
+                   frame.channel[7],
+                   (unsigned long)frame.seq);
+    }
+    else
+    {
+        rt_kprintf("[M55 IPC] send failed\r\n");
+    }
+#else
+    (void)result;
+#endif
+}
+

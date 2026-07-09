@@ -1,0 +1,26 @@
+/*
+ * Copyright (c) 2006-2021, RT-Thread Development Team
+ *
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Change Logs:
+ * Date           Author       Notes
+ * 2026-07-01     DELL       the first version
+ */
+#ifndef APPLICATIONS_VISION_IPC_TX_H_
+#define APPLICATIONS_VISION_IPC_TX_H_
+
+#include "uvc_ai.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void vision_ipc_try_send_result(const uvc_ai_result_t *result);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+#endif /* APPLICATIONS_VISION_IPC_TX_H_ */

@@ -1,0 +1,941 @@
+#include <rtthread.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#ifdef RT_USING_FINSH
+#include <finsh.h>
+#endif
+
+#include "uvc_ai.h"
+#include "usb_config.h"
+
+#undef USB_DBG_TAG
+#define USB_DBG_TAG "uvc_ai"
+#include "usb_log.h"
+
+/*
+ * V6 stable traditional detector for Edgi-Talk M55 UVC demo.
+ *
+ * This file is based on the working dark-pen/background-difference version.
+ * It keeps all public interfaces unchanged:
+ *   - uvc_ai_init()
+ *   - uvc_ai_deinit()
+ *   - uvc_ai_reset_result()
+ *   - uvc_ai_process_yuyv()
+ *
+ * Main improvements over the previous version:
+ *   1. Dynamic dark threshold, so a slightly dark room will not make the whole
+ *      image look like a pen.
+ *   2. Global illumination/object-change guard. If almost the whole frame
+ *      changes, the frame is ignored and the background is adapted instead.
+ *   3. Connected-component detection on the sampled foreground mask. This can
+ *      output several pen-like targets instead of merging everything into one
+ *      global candidate.
+ *   4. Conservative background EMA update. Foreground pixels are not learned
+ *      into the background quickly.
+ *
+ * Recommended camera command:
+ *   usbh_uvc_start 0 424 240
+ */
+
+#define BG_DIFF_SAMPLE_STEP              2U
+#define BG_WARMUP_FRAMES                 20U
+#define BG_DIFF_THRESHOLD_BASE           28U
+#define BG_DIFF_THRESHOLD_LOW            22U
+#define BG_DIFF_THRESHOLD_MID            38U
+#define BG_DIFF_THRESHOLD_HIGH           46U
+#define BG_STABLE_UPDATE_THRESHOLD       8U
+#define BG_MIN_CHANGED_PIXELS            30U
+#define BG_LOG_INTERVAL_TICKS            (RT_TICK_PER_SECOND * 1U)
+
+/* If too much of the scene changes, usually it is exposure/light/hand motion. */
+#define BG_GLOBAL_CHANGE_X100            42U
+#define BG_GLOBAL_HARD_CHANGE_X100       60U
+#define BG_GLOBAL_LIGHT_SHIFT_Y          16
+
+/* Slow background update during normal detection: bg = (63*bg + cur)/64. */
+#define BG_EMA_NORMAL_SHIFT              6U
+/* Faster adaptation only when global light changes: bg = (3*bg + cur)/4. */
+#define BG_EMA_GLOBAL_SHIFT              2U
+
+/* Dark-pen detector tuning. Increase default if the pen is not detected. */
+#define PEN_DARK_Y_DEFAULT               118U
+#define PEN_DARK_DYNAMIC_MARGIN          18U
+#define PEN_DARK_MIN_THRESHOLD           32U
+#define PEN_MIN_DARK_PIXELS              35U
+#define PEN_MIN_LONG_SIDE_SAMPLE         20U
+#define PEN_MIN_SHORT_SIDE_SAMPLE        2U
+#define PEN_MAX_REGION_RATIO_X100        35U
+#define PEN_MAX_BOX_RATIO_X100           55U
+#define PEN_MIN_AXIS_ASPECT_X100         155U
+#define PEN_MIN_MOMENT_ELONG_X100        900U
+#define PEN_BBOX_MARGIN_RAW              4
+#define PEN_MAX_COMPONENT_LABELS         256U
+
+static uint8_t  *g_bg_y = RT_NULL;
+static uint8_t  *g_mask_a = RT_NULL;
+static uint8_t  *g_mask_b = RT_NULL;
+static uint16_t *g_label = RT_NULL;
+
+static uint8_t  g_bg_valid;
+static uint8_t  g_auto_background = 1U;
+static uint16_t g_bg_warmup_count;
+static uint16_t g_src_width;
+static uint16_t g_src_height;
+static uint16_t g_sample_w;
+static uint16_t g_sample_h;
+static uint32_t g_sample_pixels;
+static rt_tick_t g_last_log_tick;
+static uint8_t  g_dark_y_threshold = PEN_DARK_Y_DEFAULT;
+static uint32_t g_frame_index;
+
+static uint16_t g_cc_parent[PEN_MAX_COMPONENT_LABELS];
+
+/* Candidate/region statistics are kept in sample-space coordinates. */
+typedef struct
+{
+    uint32_t count;
+    uint32_t min_x;
+    uint32_t min_y;
+    uint32_t max_x;
+    uint32_t max_y;
+    uint64_t sum_x;
+    uint64_t sum_y;
+    uint64_t sum_xx;
+    uint64_t sum_yy;
+    uint64_t sum_xy;
+} pen_candidate_t;
+
+typedef struct
+{
+    uint8_t valid;
+    uint32_t score_u32;
+    uint32_t count;
+    uint32_t axis_aspect_x100;
+    uint32_t moment_elong_x100;
+    int32_t raw_xmin;
+    int32_t raw_ymin;
+    int32_t raw_xmax;
+    int32_t raw_ymax;
+    float conf;
+} pen_detection_t;
+
+static inline uint8_t bg_abs_diff_u8(uint8_t a, uint8_t b)
+{
+    return (a > b) ? (uint8_t)(a - b) : (uint8_t)(b - a);
+}
+
+static inline int16_t bg_clamp_i16(int32_t value, int32_t min_v, int32_t max_v)
+{
+    if (value < min_v) value = min_v;
+    if (value > max_v) value = max_v;
+    return (int16_t)value;
+}
+
+static inline uint8_t bg_get_y_sample(const uint8_t *yuyv, uint32_t sx, uint32_t sy)
+{
+    uint32_t x = sx * BG_DIFF_SAMPLE_STEP;
+    uint32_t y = sy * BG_DIFF_SAMPLE_STEP;
+    uint32_t byte_index = (y * (uint32_t)g_src_width * 2U) + (x * 2U);
+    return yuyv[byte_index];
+}
+
+static inline int16_t bg_map_x_to_ai(int32_t raw_x)
+{
+    int32_t x;
+    if (g_src_width == 0U) return 0;
+    x = (raw_x * (int32_t)UVC_AI_IMAGE_WIDTH) / (int32_t)g_src_width;
+    return bg_clamp_i16(x, 0, (int32_t)UVC_AI_IMAGE_WIDTH - 1);
+}
+
+static inline int16_t bg_map_y_to_ai(int32_t raw_y)
+{
+    int32_t y;
+    if (g_src_height == 0U) return 0;
+    y = (raw_y * (int32_t)UVC_AI_IMAGE_HEIGHT) / (int32_t)g_src_height;
+    return bg_clamp_i16(y, 0, (int32_t)UVC_AI_IMAGE_HEIGHT - 1);
+}
+
+static void pen_candidate_reset(pen_candidate_t *c)
+{
+    if (c == RT_NULL) return;
+    memset(c, 0, sizeof(*c));
+    c->min_x = 0xFFFFFFFFUL;
+    c->min_y = 0xFFFFFFFFUL;
+}
+
+static void pen_candidate_add(pen_candidate_t *c, uint32_t sx, uint32_t sy)
+{
+    if (c == RT_NULL) return;
+    c->count++;
+    if (sx < c->min_x) c->min_x = sx;
+    if (sy < c->min_y) c->min_y = sy;
+    if (sx > c->max_x) c->max_x = sx;
+    if (sy > c->max_y) c->max_y = sy;
+    c->sum_x += sx;
+    c->sum_y += sy;
+    c->sum_xx += (uint64_t)sx * (uint64_t)sx;
+    c->sum_yy += (uint64_t)sy * (uint64_t)sy;
+    c->sum_xy += (uint64_t)sx * (uint64_t)sy;
+}
+
+static void bg_free_buffer(void)
+{
+    if (g_bg_y != RT_NULL)
+    {
+        rt_free(g_bg_y);
+        g_bg_y = RT_NULL;
+    }
+    if (g_mask_a != RT_NULL)
+    {
+        rt_free(g_mask_a);
+        g_mask_a = RT_NULL;
+    }
+    if (g_mask_b != RT_NULL)
+    {
+        rt_free(g_mask_b);
+        g_mask_b = RT_NULL;
+    }
+    if (g_label != RT_NULL)
+    {
+        rt_free(g_label);
+        g_label = RT_NULL;
+    }
+}
+
+static int bg_alloc_buffer(uint16_t width, uint16_t height)
+{
+    bg_free_buffer();
+
+    g_src_width = width;
+    g_src_height = height;
+    g_sample_w = (uint16_t)(g_src_width / BG_DIFF_SAMPLE_STEP);
+    g_sample_h = (uint16_t)(g_src_height / BG_DIFF_SAMPLE_STEP);
+
+    if ((g_sample_w == 0U) || (g_sample_h == 0U))
+    {
+        USB_LOG_ERR("invalid detector size: %ux%u\r\n", (unsigned)width, (unsigned)height);
+        return -RT_EINVAL;
+    }
+
+    g_sample_pixels = (uint32_t)g_sample_w * (uint32_t)g_sample_h;
+
+    g_bg_y = (uint8_t *)rt_malloc(g_sample_pixels);
+    g_mask_a = (uint8_t *)rt_malloc(g_sample_pixels);
+    g_mask_b = (uint8_t *)rt_malloc(g_sample_pixels);
+    g_label = (uint16_t *)rt_malloc(g_sample_pixels * sizeof(uint16_t));
+
+    if ((g_bg_y == RT_NULL) || (g_mask_a == RT_NULL) ||
+        (g_mask_b == RT_NULL) || (g_label == RT_NULL))
+    {
+        USB_LOG_ERR("detector malloc failed: samples=%lu\r\n", (unsigned long)g_sample_pixels);
+        bg_free_buffer();
+        return -RT_ENOMEM;
+    }
+
+    memset(g_bg_y, 0, g_sample_pixels);
+    memset(g_mask_a, 0, g_sample_pixels);
+    memset(g_mask_b, 0, g_sample_pixels);
+    memset(g_label, 0, g_sample_pixels * sizeof(uint16_t));
+    return RT_EOK;
+}
+
+static void bg_reset_state(void)
+{
+    g_bg_valid = 0U;
+    g_bg_warmup_count = 0U;
+    g_frame_index = 0U;
+    if (g_bg_y != RT_NULL)
+    {
+        memset(g_bg_y, 0, g_sample_pixels);
+    }
+    USB_LOG_INFO("background reset; keep desk clean for calibration\r\n");
+}
+
+/* Public helper for future APP/IPC/M33 control. */
+void uvc_ai_force_bg_reset(void)
+{
+    bg_reset_state();
+}
+
+void uvc_ai_set_auto_background(uint8_t enable)
+{
+    g_auto_background = enable ? 1U : 0U;
+    USB_LOG_INFO("auto background update: %s\r\n", g_auto_background ? "on" : "off");
+}
+
+/* Short alias, useful if later code prefers this name. */
+void uvc_ai_set_auto_bg(uint8_t enable)
+{
+    uvc_ai_set_auto_background(enable);
+}
+
+static void bg_learn_frame(const uint8_t *yuyv)
+{
+    uint32_t sx, sy, idx = 0U;
+
+    for (sy = 0U; sy < g_sample_h; sy++)
+    {
+        for (sx = 0U; sx < g_sample_w; sx++)
+        {
+            uint8_t y = bg_get_y_sample(yuyv, sx, sy);
+            if (g_bg_warmup_count == 0U)
+            {
+                g_bg_y[idx] = y;
+            }
+            else
+            {
+                /* Warmup should be reasonably fast but still average several frames. */
+                g_bg_y[idx] = (uint8_t)(((uint16_t)g_bg_y[idx] * 7U + (uint16_t)y) / 8U);
+            }
+            idx++;
+        }
+    }
+
+    if (g_bg_warmup_count < BG_WARMUP_FRAMES) g_bg_warmup_count++;
+
+    if (g_bg_warmup_count >= BG_WARMUP_FRAMES)
+    {
+        g_bg_valid = 1U;
+        USB_LOG_INFO("background ready: src=%ux%u samples=%ux%u dark_y=%u auto_bg=%u\r\n",
+                     (unsigned)g_src_width, (unsigned)g_src_height,
+                     (unsigned)g_sample_w, (unsigned)g_sample_h,
+                     (unsigned)g_dark_y_threshold,
+                     (unsigned)g_auto_background);
+    }
+}
+
+static void bg_blend_global_frame(const uint8_t *yuyv)
+{
+    uint32_t sx, sy, idx = 0U;
+
+    if (!g_auto_background) return;
+
+    for (sy = 0U; sy < g_sample_h; sy++)
+    {
+        for (sx = 0U; sx < g_sample_w; sx++)
+        {
+            uint8_t cur_y = bg_get_y_sample(yuyv, sx, sy);
+            uint8_t old_y = g_bg_y[idx];
+            /* Faster only for whole-scene light/exposure changes. */
+            g_bg_y[idx] = (uint8_t)(((uint16_t)old_y * ((1U << BG_EMA_GLOBAL_SHIFT) - 1U) +
+                                     (uint16_t)cur_y) >> BG_EMA_GLOBAL_SHIFT);
+            idx++;
+        }
+    }
+}
+
+static uint8_t bg_dynamic_diff_threshold(uint32_t rough_changed)
+{
+    uint32_t ratio_x100;
+    if (g_sample_pixels == 0U) return BG_DIFF_THRESHOLD_BASE;
+
+    ratio_x100 = (rough_changed * 100U) / g_sample_pixels;
+    if (ratio_x100 > 35U) return BG_DIFF_THRESHOLD_HIGH;
+    if (ratio_x100 > 20U) return BG_DIFF_THRESHOLD_MID;
+    if (ratio_x100 < 5U)  return BG_DIFF_THRESHOLD_LOW;
+    return BG_DIFF_THRESHOLD_BASE;
+}
+
+static uint8_t bg_dynamic_dark_threshold(uint32_t mean_y)
+{
+    uint32_t adaptive;
+    uint32_t thr = g_dark_y_threshold;
+
+    if (mean_y > PEN_DARK_DYNAMIC_MARGIN)
+    {
+        adaptive = mean_y - PEN_DARK_DYNAMIC_MARGIN;
+        if (thr > adaptive) thr = adaptive;
+    }
+
+    if (thr < PEN_DARK_MIN_THRESHOLD) thr = PEN_DARK_MIN_THRESHOLD;
+    if (thr > 254U) thr = 254U;
+    return (uint8_t)thr;
+}
+
+void uvc_ai_reset_result(uvc_ai_result_t *result)
+{
+    if (result == RT_NULL) return;
+    memset(result, 0, sizeof(*result));
+}
+
+int uvc_ai_init(const uvc_ai_config_t *config)
+{
+    uint16_t width = UVC_AI_CAMERA_WIDTH;
+    uint16_t height = UVC_AI_CAMERA_HEIGHT;
+    int ret;
+
+    if (config != RT_NULL)
+    {
+        if (config->src_width != 0U) width = config->src_width;
+        if (config->src_height != 0U) height = config->src_height;
+    }
+
+    ret = bg_alloc_buffer(width, height);
+    if (ret != RT_EOK) return ret;
+
+    bg_reset_state();
+    g_last_log_tick = 0U;
+
+    USB_LOG_INFO("V6 traditional multi-pen detector initialized, src=%ux%u, output=%ux%u\r\n",
+                 (unsigned)g_src_width, (unsigned)g_src_height,
+                 (unsigned)UVC_AI_IMAGE_WIDTH, (unsigned)UVC_AI_IMAGE_HEIGHT);
+    return RT_EOK;
+}
+
+void uvc_ai_deinit(void)
+{
+    bg_reset_state();
+    bg_free_buffer();
+    USB_LOG_INFO("V6 traditional detector deinitialized\r\n");
+}
+
+static uint16_t cc_find(uint16_t x)
+{
+    uint16_t p;
+    if ((x == 0U) || (x >= PEN_MAX_COMPONENT_LABELS)) return 0U;
+    p = g_cc_parent[x];
+    while ((p != 0U) && (p != g_cc_parent[p]))
+    {
+        g_cc_parent[p] = g_cc_parent[g_cc_parent[p]];
+        p = g_cc_parent[p];
+    }
+    return p;
+}
+
+static void cc_union(uint16_t a, uint16_t b)
+{
+    uint16_t ra = cc_find(a);
+    uint16_t rb = cc_find(b);
+    if ((ra == 0U) || (rb == 0U) || (ra == rb)) return;
+    if (ra < rb) g_cc_parent[rb] = ra;
+    else g_cc_parent[ra] = rb;
+}
+
+static void clean_mask_3x3(const uint8_t *src, uint8_t *dst)
+{
+    uint32_t sx, sy;
+    memset(dst, 0, g_sample_pixels);
+
+    if ((g_sample_w < 3U) || (g_sample_h < 3U)) return;
+
+    for (sy = 1U; sy < (uint32_t)g_sample_h - 1U; sy++)
+    {
+        for (sx = 1U; sx < (uint32_t)g_sample_w - 1U; sx++)
+        {
+            uint32_t idx = sy * (uint32_t)g_sample_w + sx;
+            uint8_t n = 0U;
+
+            if (src[idx] == 0U) continue;
+
+            n += src[idx - 1U] ? 1U : 0U;
+            n += src[idx + 1U] ? 1U : 0U;
+            n += src[idx - (uint32_t)g_sample_w] ? 1U : 0U;
+            n += src[idx + (uint32_t)g_sample_w] ? 1U : 0U;
+            n += src[idx - (uint32_t)g_sample_w - 1U] ? 1U : 0U;
+            n += src[idx - (uint32_t)g_sample_w + 1U] ? 1U : 0U;
+            n += src[idx + (uint32_t)g_sample_w - 1U] ? 1U : 0U;
+            n += src[idx + (uint32_t)g_sample_w + 1U] ? 1U : 0U;
+
+            /* Keep thin pen edges, but remove isolated one-pixel noise. */
+            if (n >= 1U) dst[idx] = 1U;
+        }
+    }
+}
+
+static uint16_t cc_label_mask(const uint8_t *mask)
+{
+    uint32_t sx, sy;
+    uint16_t label_count = 0U;
+    uint32_t i;
+
+    memset(g_label, 0, g_sample_pixels * sizeof(uint16_t));
+    memset(g_cc_parent, 0, sizeof(g_cc_parent));
+
+    for (i = 1U; i < PEN_MAX_COMPONENT_LABELS; i++)
+    {
+        g_cc_parent[i] = (uint16_t)i;
+    }
+
+    for (sy = 0U; sy < g_sample_h; sy++)
+    {
+        for (sx = 0U; sx < g_sample_w; sx++)
+        {
+            uint32_t idx = sy * (uint32_t)g_sample_w + sx;
+            uint16_t left = 0U;
+            uint16_t up = 0U;
+            uint16_t lab = 0U;
+
+            if (mask[idx] == 0U) continue;
+
+            if (sx > 0U) left = g_label[idx - 1U];
+            if (sy > 0U) up = g_label[idx - (uint32_t)g_sample_w];
+
+            if ((left == 0U) && (up == 0U))
+            {
+                if ((uint32_t)label_count + 1U < PEN_MAX_COMPONENT_LABELS)
+                {
+                    label_count++;
+                    lab = label_count;
+                    g_cc_parent[lab] = lab;
+                }
+                else
+                {
+                    lab = 0U;
+                }
+            }
+            else if (left != 0U)
+            {
+                lab = cc_find(left);
+                if (up != 0U) cc_union(left, up);
+            }
+            else
+            {
+                lab = cc_find(up);
+            }
+
+            g_label[idx] = lab;
+        }
+    }
+
+    return label_count;
+}
+
+static int detection_from_candidate(const pen_candidate_t *c, pen_detection_t *det)
+{
+    uint32_t box_w, box_h, box_area, long_side, short_side, axis_aspect_x100;
+    uint32_t region_ratio_x100, box_ratio_x100;
+    float n, mean_x, mean_y, cov_xx, cov_yy, cov_xy;
+    float trace, det_cov, moment_elong;
+    uint32_t moment_elong_x100;
+    int32_t raw_xmin, raw_ymin, raw_xmax, raw_ymax;
+    uint32_t aspect_bonus, moment_bonus, count_bonus;
+    float conf;
+
+    if ((c == RT_NULL) || (det == RT_NULL) || (c->count == 0U)) return 0;
+    if ((c->min_x > c->max_x) || (c->min_y > c->max_y)) return 0;
+
+    memset(det, 0, sizeof(*det));
+
+    box_w = c->max_x - c->min_x + 1U;
+    box_h = c->max_y - c->min_y + 1U;
+    box_area = box_w * box_h;
+    long_side = (box_w > box_h) ? box_w : box_h;
+    short_side = (box_w > box_h) ? box_h : box_w;
+    axis_aspect_x100 = (short_side == 0U) ? 9999U : (long_side * 100U) / short_side;
+
+    if ((c->count < PEN_MIN_DARK_PIXELS) ||
+        (long_side < PEN_MIN_LONG_SIDE_SAMPLE) ||
+        (short_side < PEN_MIN_SHORT_SIDE_SAMPLE))
+    {
+        return 0;
+    }
+
+    region_ratio_x100 = (g_sample_pixels == 0U) ? 0U : (c->count * 100U) / g_sample_pixels;
+    box_ratio_x100 = (g_sample_pixels == 0U) ? 0U : (box_area * 100U) / g_sample_pixels;
+    if ((region_ratio_x100 > PEN_MAX_REGION_RATIO_X100) ||
+        (box_ratio_x100 > PEN_MAX_BOX_RATIO_X100))
+    {
+        return 0;
+    }
+
+    n = (float)c->count;
+    mean_x = (float)c->sum_x / n;
+    mean_y = (float)c->sum_y / n;
+    cov_xx = ((float)c->sum_xx / n) - mean_x * mean_x;
+    cov_yy = ((float)c->sum_yy / n) - mean_y * mean_y;
+    cov_xy = ((float)c->sum_xy / n) - mean_x * mean_y;
+
+    trace = cov_xx + cov_yy;
+    det_cov = cov_xx * cov_yy - cov_xy * cov_xy;
+    if (det_cov < 0.1f) det_cov = 0.1f;
+
+    /* This ratio is high for elongated regions, including diagonal pens. */
+    moment_elong = (trace * trace * 100.0f) / det_cov;
+    if (moment_elong > 9999.0f) moment_elong = 9999.0f;
+    if (moment_elong < 0.0f) moment_elong = 0.0f;
+    moment_elong_x100 = (uint32_t)moment_elong;
+
+    if ((axis_aspect_x100 < PEN_MIN_AXIS_ASPECT_X100) &&
+        (moment_elong_x100 < PEN_MIN_MOMENT_ELONG_X100))
+    {
+        return 0;
+    }
+
+    raw_xmin = (int32_t)(c->min_x * BG_DIFF_SAMPLE_STEP) - PEN_BBOX_MARGIN_RAW;
+    raw_ymin = (int32_t)(c->min_y * BG_DIFF_SAMPLE_STEP) - PEN_BBOX_MARGIN_RAW;
+    raw_xmax = (int32_t)(((c->max_x + 1U) * BG_DIFF_SAMPLE_STEP) - 1U) + PEN_BBOX_MARGIN_RAW;
+    raw_ymax = (int32_t)(((c->max_y + 1U) * BG_DIFF_SAMPLE_STEP) - 1U) + PEN_BBOX_MARGIN_RAW;
+
+    if (raw_xmin < 0) raw_xmin = 0;
+    if (raw_ymin < 0) raw_ymin = 0;
+    if (raw_xmax >= g_src_width) raw_xmax = (int32_t)g_src_width - 1;
+    if (raw_ymax >= g_src_height) raw_ymax = (int32_t)g_src_height - 1;
+
+    aspect_bonus = (axis_aspect_x100 > 2000U) ? 2000U : axis_aspect_x100;
+    moment_bonus = (moment_elong_x100 > 5000U) ? 5000U : moment_elong_x100;
+    count_bonus = (c->count > 2500U) ? 2500U : c->count;
+
+    det->valid = 1U;
+    det->count = c->count;
+    det->axis_aspect_x100 = axis_aspect_x100;
+    det->moment_elong_x100 = moment_elong_x100;
+    det->raw_xmin = raw_xmin;
+    det->raw_ymin = raw_ymin;
+    det->raw_xmax = raw_xmax;
+    det->raw_ymax = raw_ymax;
+    det->score_u32 = count_bonus * 3U + long_side * 12U + aspect_bonus + (moment_bonus / 2U);
+
+    conf = 0.45f;
+    conf += ((float)aspect_bonus / 2000.0f) * 0.20f;
+    conf += ((float)moment_bonus / 5000.0f) * 0.18f;
+    conf += ((float)count_bonus / 2500.0f) * 0.15f;
+    if (conf > 0.96f) conf = 0.96f;
+    det->conf = conf;
+    return 1;
+}
+
+static void insert_detection_sorted(pen_detection_t *list, uint8_t *count, const pen_detection_t *det)
+{
+    int i;
+    int pos;
+
+    if ((list == RT_NULL) || (count == RT_NULL) || (det == RT_NULL) || !det->valid) return;
+
+    pos = *count;
+    if (pos >= UVC_AI_MAX_PREDICTIONS)
+    {
+        if (det->score_u32 <= list[UVC_AI_MAX_PREDICTIONS - 1U].score_u32) return;
+        pos = UVC_AI_MAX_PREDICTIONS - 1U;
+    }
+    else
+    {
+        (*count)++;
+    }
+
+    for (i = pos - 1; i >= 0; i--)
+    {
+        if (det->score_u32 <= list[i].score_u32) break;
+        if ((uint32_t)i + 1U < UVC_AI_MAX_PREDICTIONS)
+        {
+            list[i + 1] = list[i];
+        }
+    }
+    list[i + 1] = *det;
+}
+
+static uint8_t build_detections_from_mask(const uint8_t *mask, pen_detection_t *out_list)
+{
+    pen_candidate_t regions[PEN_MAX_COMPONENT_LABELS];
+    uint16_t label_count;
+    uint32_t i;
+    uint8_t out_count = 0U;
+
+    if ((mask == RT_NULL) || (out_list == RT_NULL)) return 0U;
+
+    for (i = 0U; i < UVC_AI_MAX_PREDICTIONS; i++)
+    {
+        memset(&out_list[i], 0, sizeof(out_list[i]));
+    }
+
+    label_count = cc_label_mask(mask);
+    if (label_count == 0U) return 0U;
+
+    for (i = 0U; i < PEN_MAX_COMPONENT_LABELS; i++)
+    {
+        pen_candidate_reset(&regions[i]);
+    }
+
+    for (i = 0U; i < g_sample_pixels; i++)
+    {
+        uint16_t lab = g_label[i];
+        uint16_t root;
+        uint32_t sx, sy;
+
+        if (lab == 0U) continue;
+        root = cc_find(lab);
+        if ((root == 0U) || (root >= PEN_MAX_COMPONENT_LABELS)) continue;
+        g_label[i] = root;
+
+        sx = i % g_sample_w;
+        sy = i / g_sample_w;
+        pen_candidate_add(&regions[root], sx, sy);
+    }
+
+    for (i = 1U; i <= label_count; i++)
+    {
+        pen_detection_t det;
+        if (detection_from_candidate(&regions[i], &det))
+        {
+            insert_detection_sorted(out_list, &out_count, &det);
+        }
+    }
+
+    return out_count;
+}
+
+static void fill_result_from_detections(const pen_detection_t *dets, uint8_t det_count, uvc_ai_result_t *result)
+{
+    uint8_t i;
+
+    if ((dets == RT_NULL) || (result == RT_NULL)) return;
+
+    uvc_ai_reset_result(result);
+    result->valid = 1U;
+    result->count = det_count;
+
+    for (i = 0U; (i < det_count) && (i < UVC_AI_MAX_PREDICTIONS); i++)
+    {
+        uint32_t base = (uint32_t)i * 4U;
+        result->class_id[i] = 0U;
+        result->conf[i] = dets[i].conf;
+        (void)snprintf(result->class_string[i], UVC_AI_MAX_CLASS_LEN, "pen");
+
+        result->bbox_int16[base + 0U] = bg_map_x_to_ai(dets[i].raw_xmin);
+        result->bbox_int16[base + 1U] = bg_map_y_to_ai(dets[i].raw_ymin);
+        result->bbox_int16[base + 2U] = bg_map_x_to_ai(dets[i].raw_xmax);
+        result->bbox_int16[base + 3U] = bg_map_y_to_ai(dets[i].raw_ymax);
+    }
+}
+
+int uvc_ai_process_yuyv(const uint8_t *yuyv, uint32_t yuyv_size, uvc_ai_result_t *result)
+{
+    uint32_t min_frame_size;
+    rt_tick_t start_tick, end_tick, now_tick;
+    uint32_t sx, sy, idx;
+    uint64_t sum_y = 0ULL;
+    int64_t signed_delta_sum = 0LL;
+    uint32_t rough_changed = 0U;
+    uint32_t raw_mask_pixels = 0U;
+    uint32_t mean_y;
+    int32_t avg_signed_delta;
+    uint32_t global_ratio_x100;
+    uint8_t diff_threshold;
+    uint8_t dark_threshold;
+    pen_detection_t detections[UVC_AI_MAX_PREDICTIONS];
+    uint8_t det_count;
+
+    if ((yuyv == RT_NULL) || (result == RT_NULL)) return -RT_EINVAL;
+    if ((g_bg_y == RT_NULL) || (g_src_width == 0U) || (g_src_height == 0U)) return -RT_ERROR;
+
+    min_frame_size = (uint32_t)g_src_width * (uint32_t)g_src_height * 2U;
+    if (yuyv_size < min_frame_size)
+    {
+        USB_LOG_WRN("frame too small: %lu < %lu for %ux%u\r\n",
+                    (unsigned long)yuyv_size, (unsigned long)min_frame_size,
+                    (unsigned)g_src_width, (unsigned)g_src_height);
+        return -RT_EINVAL;
+    }
+
+    start_tick = rt_tick_get();
+    uvc_ai_reset_result(result);
+    result->valid = 1U;
+
+    if (!g_bg_valid)
+    {
+        bg_learn_frame(yuyv);
+        end_tick = rt_tick_get();
+        result->inference_ms = ((float)(end_tick - start_tick) * 1000.0f) / (float)RT_TICK_PER_SECOND;
+        return RT_EOK;
+    }
+
+    /* Pass 1: scene statistics. */
+    idx = 0U;
+    for (sy = 0U; sy < g_sample_h; sy++)
+    {
+        for (sx = 0U; sx < g_sample_w; sx++)
+        {
+            uint8_t cur_y = bg_get_y_sample(yuyv, sx, sy);
+            uint8_t old_y = g_bg_y[idx];
+            uint8_t diff = bg_abs_diff_u8(cur_y, old_y);
+
+            sum_y += cur_y;
+            signed_delta_sum += (int32_t)cur_y - (int32_t)old_y;
+            if (diff > BG_DIFF_THRESHOLD_BASE) rough_changed++;
+            idx++;
+        }
+    }
+
+    mean_y = (uint32_t)(sum_y / (uint64_t)g_sample_pixels);
+    avg_signed_delta = (int32_t)(signed_delta_sum / (int64_t)g_sample_pixels);
+    global_ratio_x100 = (rough_changed * 100U) / g_sample_pixels;
+    diff_threshold = bg_dynamic_diff_threshold(rough_changed);
+    dark_threshold = bg_dynamic_dark_threshold(mean_y);
+
+    /* Whole-frame changes are usually auto-exposure/light/hand motion, not a pen. */
+    if ((global_ratio_x100 >= BG_GLOBAL_HARD_CHANGE_X100) ||
+        ((global_ratio_x100 >= BG_GLOBAL_CHANGE_X100) &&
+         ((avg_signed_delta > BG_GLOBAL_LIGHT_SHIFT_Y) || (avg_signed_delta < -BG_GLOBAL_LIGHT_SHIFT_Y))))
+    {
+        bg_blend_global_frame(yuyv);
+        end_tick = rt_tick_get();
+        result->inference_ms = ((float)(end_tick - start_tick) * 1000.0f) / (float)RT_TICK_PER_SECOND;
+
+        now_tick = rt_tick_get();
+        if ((g_last_log_tick == 0U) || ((now_tick - g_last_log_tick) >= BG_LOG_INTERVAL_TICKS))
+        {
+            USB_LOG_INFO("scene/global change ignored: ratio=%lu%% avg_delta=%ld mean_y=%lu auto_bg=%u\r\n",
+                         (unsigned long)global_ratio_x100,
+                         (long)avg_signed_delta,
+                         (unsigned long)mean_y,
+                         (unsigned)g_auto_background);
+            g_last_log_tick = now_tick;
+        }
+        return RT_EOK;
+    }
+
+    /* Pass 2: build foreground mask and update stable background pixels. */
+    idx = 0U;
+    memset(g_mask_a, 0, g_sample_pixels);
+    for (sy = 0U; sy < g_sample_h; sy++)
+    {
+        for (sx = 0U; sx < g_sample_w; sx++)
+        {
+            uint8_t cur_y = bg_get_y_sample(yuyv, sx, sy);
+            uint8_t old_y = g_bg_y[idx];
+            uint8_t diff = bg_abs_diff_u8(cur_y, old_y);
+            uint8_t dark_like;
+            uint8_t diff_like;
+            uint8_t is_fg;
+
+            /* The mean-relative term prevents a dim room from becoming all-foreground. */
+            dark_like = ((cur_y <= dark_threshold) &&
+                         (((uint32_t)cur_y + 10U < mean_y) ||
+                          ((uint32_t)cur_y + 8U < old_y))) ? 1U : 0U;
+
+            /* Prefer darker-than-background changes for pen-like objects. */
+            diff_like = ((diff > diff_threshold) && ((uint32_t)cur_y + 4U < old_y)) ? 1U : 0U;
+            is_fg = (dark_like || diff_like) ? 1U : 0U;
+
+            g_mask_a[idx] = is_fg;
+            if (is_fg) raw_mask_pixels++;
+
+            if (g_auto_background && !is_fg && (diff <= BG_STABLE_UPDATE_THRESHOLD))
+            {
+                g_bg_y[idx] = (uint8_t)(((uint16_t)old_y * ((1U << BG_EMA_NORMAL_SHIFT) - 1U) +
+                                         (uint16_t)cur_y) >> BG_EMA_NORMAL_SHIFT);
+            }
+
+            idx++;
+        }
+    }
+
+    /* Avoid extracting regions when the actual foreground mask is too large. */
+    if (((raw_mask_pixels * 100U) / g_sample_pixels) > PEN_MAX_REGION_RATIO_X100)
+    {
+        end_tick = rt_tick_get();
+        result->inference_ms = ((float)(end_tick - start_tick) * 1000.0f) / (float)RT_TICK_PER_SECOND;
+
+        now_tick = rt_tick_get();
+        if ((g_last_log_tick == 0U) || ((now_tick - g_last_log_tick) >= BG_LOG_INTERVAL_TICKS))
+        {
+            USB_LOG_INFO("foreground too large, ignored: fg=%lu/%lu mean_y=%lu dark_thr=%u diff_thr=%u\r\n",
+                         (unsigned long)raw_mask_pixels,
+                         (unsigned long)g_sample_pixels,
+                         (unsigned long)mean_y,
+                         (unsigned)dark_threshold,
+                         (unsigned)diff_threshold);
+            g_last_log_tick = now_tick;
+        }
+        return RT_EOK;
+    }
+
+    if (raw_mask_pixels >= BG_MIN_CHANGED_PIXELS)
+    {
+        clean_mask_3x3(g_mask_a, g_mask_b);
+        det_count = build_detections_from_mask(g_mask_b, detections);
+        fill_result_from_detections(detections, det_count, result);
+    }
+    else
+    {
+        det_count = 0U;
+    }
+
+    end_tick = rt_tick_get();
+    result->inference_ms = ((float)(end_tick - start_tick) * 1000.0f) / (float)RT_TICK_PER_SECOND;
+
+    now_tick = rt_tick_get();
+    if ((g_last_log_tick == 0U) || ((now_tick - g_last_log_tick) >= BG_LOG_INTERVAL_TICKS))
+    {
+        if (result->count > 0U)
+        {
+            uint8_t i;
+            for (i = 0U; i < result->count; i++)
+            {
+                uint32_t base = (uint32_t)i * 4U;
+                int16_t cx = (int16_t)((result->bbox_int16[base + 0U] + result->bbox_int16[base + 2U]) / 2);
+                int16_t cy = (int16_t)((result->bbox_int16[base + 1U] + result->bbox_int16[base + 3U]) / 2);
+                USB_LOG_INFO("target%u pen %.1f%% bbox_ai=[%d,%d,%d,%d] center=(%d,%d) raw_fg=%lu mean_y=%lu dthr=%u bthr=%u time=%.1fms\r\n",
+                             (unsigned)i,
+                             result->conf[i] * 100.0f,
+                             result->bbox_int16[base + 0U], result->bbox_int16[base + 1U],
+                             result->bbox_int16[base + 2U], result->bbox_int16[base + 3U],
+                             cx, cy,
+                             (unsigned long)raw_mask_pixels,
+                             (unsigned long)mean_y,
+                             (unsigned)dark_threshold,
+                             (unsigned)diff_threshold,
+                             result->inference_ms);
+            }
+        }
+        else
+        {
+            USB_LOG_INFO("no pen src=%ux%u fg=%lu rough=%lu%% mean_y=%lu dthr=%u bthr=%u auto_bg=%u time=%.1fms\r\n",
+                         (unsigned)g_src_width, (unsigned)g_src_height,
+                         (unsigned long)raw_mask_pixels,
+                         (unsigned long)global_ratio_x100,
+                         (unsigned long)mean_y,
+                         (unsigned)dark_threshold,
+                         (unsigned)diff_threshold,
+                         (unsigned)g_auto_background,
+                         result->inference_ms);
+        }
+        g_last_log_tick = now_tick;
+    }
+
+    g_frame_index++;
+    return RT_EOK;
+}
+
+#ifdef FINSH_USING_MSH
+static int uvc_ai_bg_reset(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    bg_reset_state();
+    return 0;
+}
+MSH_CMD_EXPORT(uvc_ai_bg_reset, reset UVC AI background image);
+
+static int uvc_ai_bg_auto(int argc, char **argv)
+{
+    int value;
+    if (argc >= 2)
+    {
+        value = atoi(argv[1]);
+        g_auto_background = (value != 0) ? 1U : 0U;
+    }
+    USB_LOG_INFO("auto background update = %u, usage: uvc_ai_bg_auto 0|1\r\n",
+                 (unsigned)g_auto_background);
+    return 0;
+}
+MSH_CMD_EXPORT(uvc_ai_bg_auto, enable or disable auto background update);
+
+static int uvc_ai_dark_threshold(int argc, char **argv)
+{
+    int value;
+    if (argc >= 2)
+    {
+        value = atoi(argv[1]);
+        if (value < 1) value = 1;
+        if (value > 254) value = 254;
+        g_dark_y_threshold = (uint8_t)value;
+    }
+    USB_LOG_INFO("dark pen max Y threshold = %u, usage: uvc_ai_dark_threshold 118\r\n",
+                 (unsigned)g_dark_y_threshold);
+    return 0;
+}
+MSH_CMD_EXPORT(uvc_ai_dark_threshold, set dark pen maximum Y threshold);
+#endif

@@ -1,0 +1,1514 @@
+/*
+ * Desktop Robot Arm APP bridge for RT-Thread.
+ *
+ * Purpose:
+ * - Connect the board to a Wi-Fi router / phone hotspot as STA.
+ * - Expose HTTP APIs used by the Flutter WebView / React APP.
+ * - Keep the implementation independent from unfinished motion-control code.
+ *
+ * APP device address:
+ *   http://<STA DHCP IP>
+ *
+ * Required RT-Thread components:
+ * - WLAN management framework
+ * - SAL / BSD socket API
+ * - lwIP or another TCP/IP stack supported by SAL
+ */
+
+#include <rtthread.h>
+#include <rtdevice.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include <sys/socket.h>
+#include <netdb.h>
+#include <netdev.h>
+#include <netdev_ipaddr.h>
+
+#include "uvc_ai_app.h"
+#include "vision_ipc_tx.h"
+
+#ifdef LWIP_USING_DHCPD
+#include "../rt-thread/components/net/lwip-dhcpd/dhcp_server.h"
+#endif
+
+#ifndef ROBOT_WIFI_AP_IF
+#ifdef RT_WLAN_DEVICE_AP_NAME
+#define ROBOT_WIFI_AP_IF          RT_WLAN_DEVICE_AP_NAME
+#else
+#define ROBOT_WIFI_AP_IF          "wlan1"
+#endif
+#endif
+
+#ifndef ROBOT_WIFI_AP_IF_FALLBACK
+#ifdef RT_WLAN_DEVICE_STA_NAME
+#define ROBOT_WIFI_AP_IF_FALLBACK RT_WLAN_DEVICE_STA_NAME
+#else
+#define ROBOT_WIFI_AP_IF_FALLBACK "wlan0"
+#endif
+#endif
+
+#ifndef ROBOT_WIFI_AP_SSID
+#define ROBOT_WIFI_AP_SSID        "RobotArm_AP"
+#endif
+
+#ifndef ROBOT_WIFI_AP_PASSWORD
+#define ROBOT_WIFI_AP_PASSWORD    "12345678"
+#endif
+#ifndef ROBOT_WIFI_STA_IF
+#ifdef RT_WLAN_DEVICE_STA_NAME
+#define ROBOT_WIFI_STA_IF          RT_WLAN_DEVICE_STA_NAME
+#else
+#define ROBOT_WIFI_STA_IF          "wlan0"
+#endif
+#endif
+
+#ifndef ROBOT_WIFI_STA_SSID
+#define ROBOT_WIFI_STA_SSID        "yyfnetwork"
+#endif
+
+#ifndef ROBOT_WIFI_STA_PASSWORD
+#define ROBOT_WIFI_STA_PASSWORD    "yyf20060303"
+#endif
+#ifndef ROBOT_HTTP_PORT
+#define ROBOT_HTTP_PORT           80
+#endif
+
+#ifndef ROBOT_WIFI_AP_IP
+#define ROBOT_WIFI_AP_IP          "192.168.4.1"
+#endif
+
+#ifndef ROBOT_WIFI_AP_NETMASK
+#define ROBOT_WIFI_AP_NETMASK     "255.255.255.0"
+#endif
+
+#ifndef ROBOT_NETDEV_AP_IF
+#define ROBOT_NETDEV_AP_IF        "w1"
+#endif
+
+#ifndef ROBOT_NETDEV_AP_IF_FALLBACK
+#define ROBOT_NETDEV_AP_IF_FALLBACK "w0"
+#endif
+
+#define ROBOT_HTTP_RECV_SIZE      2048
+#define ROBOT_PLAN_JSON_SIZE      1536
+#define ROBOT_CAMERA_MAX_WIDTH    424U
+#define ROBOT_CAMERA_MAX_HEIGHT   240U
+#define ROBOT_CAMERA_FRAME_BYTES  (ROBOT_CAMERA_MAX_WIDTH * ROBOT_CAMERA_MAX_HEIGHT * 2U)
+#define ROBOT_CAMERA_ROW_MAX      (((ROBOT_CAMERA_MAX_WIDTH * 3U) + 3U) & ~3U)
+#define ROBOT_CAMERA_PREVIEW_SCALE 1U
+
+static char g_plan_json[ROBOT_PLAN_JSON_SIZE] = "{\"plans\":[]}";
+static char g_last_command[64] = "idle";
+static rt_bool_t g_wifi_ready = RT_FALSE;
+static rt_bool_t g_http_ready = RT_FALSE;
+static rt_bool_t g_bridge_started = RT_FALSE;
+static rt_bool_t g_voice_listening = RT_FALSE;
+static int g_board_voice_seq = 0;
+static char g_board_voice_text[96] = "";
+static rt_bool_t g_arm_calibrating = RT_FALSE;
+static rt_bool_t g_arm_corner_tl = RT_FALSE;
+static rt_bool_t g_arm_corner_tr = RT_FALSE;
+static rt_bool_t g_arm_corner_bl = RT_FALSE;
+static rt_bool_t g_arm_corner_br = RT_FALSE;
+static char g_selected_target_class[24] = "";
+static int g_selected_target_id = 0;
+static int g_selected_target_cx = -1;
+static int g_selected_target_cy = -1;
+
+static void robot_print_netdev(const char *if_name)
+{
+    struct netdev *netdev;
+    char ip[32] = "unknown";
+    char mask[32] = "unknown";
+    char gw[32] = "unknown";
+
+    netdev = netdev_get_by_name(if_name);
+    if (!netdev)
+    {
+        rt_kprintf("[robot] netdev %s: not found\n", if_name);
+        return;
+    }
+
+    inet_ntoa_r(netdev->ip_addr, ip, sizeof(ip));
+    inet_ntoa_r(netdev->netmask, mask, sizeof(mask));
+    inet_ntoa_r(netdev->gw, gw, sizeof(gw));
+
+    rt_kprintf("[robot] netdev %s found\n", if_name);
+    rt_kprintf("[robot]   ip      : %s\n", ip);
+    rt_kprintf("[robot]   netmask : %s\n", mask);
+    rt_kprintf("[robot]   gateway : %s\n", gw);
+    rt_kprintf("[robot]   flags   : 0x%04x up=%d link=%d dhcp=%d\n",
+               netdev->flags,
+               netdev_is_up(netdev),
+               netdev_is_link_up(netdev),
+               netdev_is_dhcp_enabled(netdev));
+}
+
+static struct netdev *robot_get_ap_netdev(const char *wlan_if, const char **netdev_name)
+{
+    struct netdev *netdev;
+
+    netdev = netdev_get_by_name(wlan_if);
+    if (netdev)
+    {
+        *netdev_name = wlan_if;
+        return netdev;
+    }
+
+    if (strcmp(wlan_if, "wlan1") == 0)
+    {
+        netdev = netdev_get_by_name("w1");
+        if (netdev)
+        {
+            *netdev_name = "w1";
+            return netdev;
+        }
+    }
+
+    if (strcmp(wlan_if, "wlan0") == 0)
+    {
+        netdev = netdev_get_by_name("w0");
+        if (netdev)
+        {
+            *netdev_name = "w0";
+            return netdev;
+        }
+    }
+
+    netdev = netdev_get_by_name(ROBOT_NETDEV_AP_IF);
+    if (netdev)
+    {
+        *netdev_name = ROBOT_NETDEV_AP_IF;
+        return netdev;
+    }
+
+    netdev = netdev_get_by_name(ROBOT_NETDEV_AP_IF_FALLBACK);
+    if (netdev)
+    {
+        *netdev_name = ROBOT_NETDEV_AP_IF_FALLBACK;
+        return netdev;
+    }
+
+    *netdev_name = wlan_if;
+    return RT_NULL;
+}
+
+static void robot_send_all(int client, const char *data, int len)
+{
+    int sent_total = 0;
+
+    while (sent_total < len)
+    {
+        int sent = send(client, data + sent_total, len - sent_total, 0);
+        if (sent <= 0)
+        {
+            rt_kprintf("[robot] send failed: %d\n", sent);
+            return;
+        }
+        sent_total += sent;
+    }
+}
+
+static void robot_send_response(int client, const char *status, const char *content_type, const char *body)
+{
+    char header[256];
+    int body_len = body ? (int)strlen(body) : 0;
+
+    rt_snprintf(header, sizeof(header),
+                "HTTP/1.1 %s\r\n"
+                "Content-Type: %s\r\n"
+                "Content-Length: %d\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
+                "Access-Control-Allow-Headers: Content-Type\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                status, content_type, body_len);
+
+    robot_send_all(client, header, (int)strlen(header));
+    if (body_len > 0)
+    {
+        robot_send_all(client, body, body_len);
+    }
+}
+
+static void robot_send_binary_header(int client, const char *status, const char *content_type, int body_len)
+{
+    char header[256];
+
+    rt_snprintf(header, sizeof(header),
+                "HTTP/1.1 %s\r\n"
+                "Content-Type: %s\r\n"
+                "Content-Length: %d\r\n"
+                "Access-Control-Allow-Origin: *\r\n"
+                "Cache-Control: no-store\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                status, content_type, body_len);
+
+    robot_send_all(client, header, (int)strlen(header));
+}
+
+static void robot_send_json(int client, const char *body)
+{
+    robot_send_response(client, "200 OK", "application/json", body);
+}
+
+static void robot_put_le16(uint8_t *dst, uint16_t value)
+{
+    dst[0] = (uint8_t)(value & 0xffU);
+    dst[1] = (uint8_t)((value >> 8) & 0xffU);
+}
+
+static void robot_put_le32(uint8_t *dst, uint32_t value)
+{
+    dst[0] = (uint8_t)(value & 0xffU);
+    dst[1] = (uint8_t)((value >> 8) & 0xffU);
+    dst[2] = (uint8_t)((value >> 16) & 0xffU);
+    dst[3] = (uint8_t)((value >> 24) & 0xffU);
+}
+
+static uint8_t robot_clip_u8(int value)
+{
+    if (value < 0) return 0U;
+    if (value > 255) return 255U;
+    return (uint8_t)value;
+}
+
+static void robot_handle_camera_frame(int client, const char *path)
+{
+    uint8_t *yuyv;
+    uint8_t bmp_header[54];
+    uint8_t row_buf[ROBOT_CAMERA_ROW_MAX];
+    uint16_t width = 0;
+    uint16_t height = 0;
+    uint16_t out_width = 0;
+    uint16_t out_height = 0;
+    uint32_t frame_size = 0;
+    uint32_t row_stride;
+    uint32_t image_size;
+    uint32_t file_size;
+    uint32_t output_scale = ROBOT_CAMERA_PREVIEW_SCALE;
+    int ret;
+    uint32_t y;
+
+    if ((path != RT_NULL) && (strstr(path, "full=1") != RT_NULL || strstr(path, "size=full") != RT_NULL))
+    {
+        output_scale = 1U;
+    }
+
+    yuyv = (uint8_t *)rt_malloc(ROBOT_CAMERA_FRAME_BYTES);
+    if (yuyv == RT_NULL)
+    {
+        rt_kprintf("[robot] camera frame: alloc failed (%u bytes)\n", (unsigned)ROBOT_CAMERA_FRAME_BYTES);
+        robot_send_response(client, "503 Service Unavailable", "application/json",
+                            "{\"ok\":false,\"error\":\"camera frame buffer alloc failed\"}");
+        return;
+    }
+
+    ret = uvc_ai_app_snapshot_yuyv(yuyv, ROBOT_CAMERA_FRAME_BYTES, &width, &height, &frame_size);
+    if (ret != RT_EOK || width == 0U || height == 0U)
+    {
+        rt_free(yuyv);
+        rt_kprintf("[robot] camera frame: not ready ret=%d width=%u height=%u\n",
+                   ret, (unsigned)width, (unsigned)height);
+        robot_send_response(client, "404 Not Found", "application/json",
+                            "{\"ok\":false,\"error\":\"camera frame not ready\"}");
+        return;
+    }
+
+    if (width > ROBOT_CAMERA_MAX_WIDTH || height > ROBOT_CAMERA_MAX_HEIGHT)
+    {
+        rt_free(yuyv);
+        rt_kprintf("[robot] camera frame: too large %ux%u\n", (unsigned)width, (unsigned)height);
+        robot_send_response(client, "413 Payload Too Large", "application/json",
+                            "{\"ok\":false,\"error\":\"camera frame exceeds preview buffer\"}");
+        return;
+    }
+
+    out_width = (uint16_t)(width / output_scale);
+    out_height = (uint16_t)(height / output_scale);
+    if (out_width == 0U || out_height == 0U)
+    {
+        rt_free(yuyv);
+        rt_kprintf("[robot] camera frame: invalid preview size from %ux%u\n",
+                   (unsigned)width, (unsigned)height);
+        robot_send_response(client, "404 Not Found", "application/json",
+                            "{\"ok\":false,\"error\":\"camera preview size invalid\"}");
+        return;
+    }
+
+    row_stride = ((uint32_t)out_width * 3U + 3U) & ~3U;
+    image_size = row_stride * (uint32_t)out_height;
+    file_size = 54U + image_size;
+
+    memset(bmp_header, 0, sizeof(bmp_header));
+    bmp_header[0] = 'B';
+    bmp_header[1] = 'M';
+    robot_put_le32(&bmp_header[2], file_size);
+    robot_put_le32(&bmp_header[10], 54U);
+    robot_put_le32(&bmp_header[14], 40U);
+    robot_put_le32(&bmp_header[18], out_width);
+    robot_put_le32(&bmp_header[22], out_height);
+    robot_put_le16(&bmp_header[26], 1U);
+    robot_put_le16(&bmp_header[28], 24U);
+    robot_put_le32(&bmp_header[34], image_size);
+
+    robot_send_binary_header(client, "200 OK", "image/bmp", (int)file_size);
+    robot_send_all(client, (const char *)bmp_header, sizeof(bmp_header));
+    rt_kprintf("[robot] camera frame: %ux%u -> %ux%u scale=%lu bmp=%lu bytes\n",
+               (unsigned)width,
+               (unsigned)height,
+               (unsigned)out_width,
+               (unsigned)out_height,
+               (unsigned long)output_scale,
+               (unsigned long)file_size);
+
+    for (y = 0; y < out_height; y++)
+    {
+        uint32_t src_y = ((uint32_t)out_height - 1U - y) * output_scale;
+        uint32_t x;
+
+        memset(row_buf, 0, row_stride);
+        for (x = 0; x < out_width; x++)
+        {
+            uint32_t src_x = x * output_scale;
+            uint32_t pair_x = src_x & ~1U;
+            uint32_t src = ((src_y * (uint32_t)width) + pair_x) * 2U;
+            uint8_t yy = yuyv[src + ((src_x & 1U) ? 2U : 0U)];
+            int u = (int)yuyv[src + 1U] - 128;
+            int v = (int)yuyv[src + 3U] - 128;
+            int r = (int)yy + ((359 * v) >> 8);
+            int g = (int)yy - ((88 * u + 183 * v) >> 8);
+            int b = (int)yy + ((454 * u) >> 8);
+            uint32_t dst = x * 3U;
+
+            row_buf[dst] = robot_clip_u8(b);
+            row_buf[dst + 1U] = robot_clip_u8(g);
+            row_buf[dst + 2U] = robot_clip_u8(r);
+        }
+        robot_send_all(client, (const char *)row_buf, (int)row_stride);
+    }
+
+    rt_free(yuyv);
+}
+
+static void robot_handle_vision_result(int client)
+{
+    uvc_ai_result_t result;
+    char body[1536];
+
+    memset(&result, 0, sizeof(result));
+    uvc_ai_app_get_latest_result(&result);
+
+    if (result.valid && result.count > 0U)
+    {
+        uint8_t count = result.count;
+        uint8_t i;
+        int16_t x0 = result.bbox_int16[0];
+        int16_t y0 = result.bbox_int16[1];
+        int16_t x1 = result.bbox_int16[2];
+        int16_t y1 = result.bbox_int16[3];
+        int16_t cx = (int16_t)((x0 + x1) / 2);
+        int16_t cy = (int16_t)((y0 + y1) / 2);
+        int score = (int)(result.conf[0] * 100.0f);
+        int offset;
+
+        if (score < 0) score = 0;
+        if (score > 100) score = 100;
+        if (count > UVC_AI_MAX_PREDICTIONS) count = UVC_AI_MAX_PREDICTIONS;
+
+        rt_kprintf("[robot] vision result: targetCount=%u first=%s cx=%d cy=%d score=%d\r\n",
+                   (unsigned)count,
+                   result.label[0],
+                   cx,
+                   cy,
+                   score);
+
+        offset = rt_snprintf(body, sizeof(body),
+                             "{"
+                             "\"ok\":true,"
+                             "\"type\":\"vision_target\","
+                             "\"valid\":true,"
+                             "\"class\":\"%s\","
+                             "\"classId\":%u,"
+                             "\"score\":%d,"
+                             "\"cx\":%d,"
+                             "\"cy\":%d,"
+                             "\"bbox\":[%d,%d,%d,%d],"
+                             "\"targetCount\":%u,"
+                             "\"selectedIndex\":0,"
+                             "\"targets\":[",
+                             result.label[0],
+                             (unsigned)result.class_id[0],
+                             score,
+                             cx,
+                             cy,
+                             x0,
+                             y0,
+                             x1,
+                             y1,
+                             (unsigned)count);
+
+        for (i = 0U; (i < count) && (offset > 0) && (offset < (int)sizeof(body)); i++)
+        {
+            uint32_t base = (uint32_t)i * 4U;
+            int16_t tx0 = result.bbox_int16[base];
+            int16_t ty0 = result.bbox_int16[base + 1U];
+            int16_t tx1 = result.bbox_int16[base + 2U];
+            int16_t ty1 = result.bbox_int16[base + 3U];
+            int16_t tcx = (int16_t)((tx0 + tx1) / 2);
+            int16_t tcy = (int16_t)((ty0 + ty1) / 2);
+            int tscore = (int)(result.conf[i] * 100.0f);
+            int written;
+
+            if (tscore < 0) tscore = 0;
+            if (tscore > 100) tscore = 100;
+
+            written = rt_snprintf(body + offset,
+                                  sizeof(body) - (rt_size_t)offset,
+                                  "%s{"
+                                  "\"id\":%u,"
+                                  "\"class\":\"%s\","
+                                  "\"classId\":%u,"
+                                  "\"score\":%d,"
+                                  "\"cx\":%d,"
+                                  "\"cy\":%d,"
+                                  "\"bbox\":[%d,%d,%d,%d]"
+                                  "}",
+                                  (i == 0U) ? "" : ",",
+                                  (unsigned)i + 1U,
+                                  result.label[i],
+                                  (unsigned)result.class_id[i],
+                                  tscore,
+                                  tcx,
+                                  tcy,
+                                  tx0,
+                                  ty0,
+                                  tx1,
+                                  ty1);
+            if (written <= 0) break;
+            offset += written;
+        }
+
+        if ((offset > 0) && (offset < (int)sizeof(body)))
+        {
+            rt_snprintf(body + offset, sizeof(body) - (rt_size_t)offset, "]}");
+        }
+    }
+    else
+    {
+        rt_kprintf("[robot] vision result: targetCount=0\r\n");
+        rt_snprintf(body, sizeof(body),
+                    "{"
+                    "\"ok\":true,"
+                    "\"type\":\"vision_target\","
+                    "\"valid\":false,"
+                    "\"class\":\"none\","
+                    "\"cx\":null,"
+                    "\"cy\":null,"
+                    "\"targetCount\":0,"
+                    "\"targets\":[]"
+                    "}");
+    }
+
+    robot_send_json(client, body);
+}
+
+static void robot_handle_status(int client)
+{
+    char body[384];
+
+    rt_snprintf(body, sizeof(body),
+                "{"
+                "\"device\":\"desktop_robot_arm\","
+                "\"chip\":\"Infineon Edgi-Talk\","
+                "\"wifi\":\"%s\","
+                "\"http\":\"%s\","
+                "\"status\":\"online\","
+                "\"lastCommand\":\"%s\""
+                "}",
+                g_wifi_ready ? "ready" : "starting",
+                g_http_ready ? "ready" : "starting",
+                g_last_command);
+
+    robot_send_json(client, body);
+}
+
+static void robot_save_plan_body(const char *request)
+{
+    const char *body = strstr(request, "\r\n\r\n");
+    size_t body_len;
+
+    if (!body)
+    {
+        return;
+    }
+
+    body += 4;
+    body_len = strlen(body);
+    if (body_len >= sizeof(g_plan_json))
+    {
+        body_len = sizeof(g_plan_json) - 1;
+    }
+
+    memcpy(g_plan_json, body, body_len);
+    g_plan_json[body_len] = '\0';
+}
+
+static void robot_mark_command(const char *command)
+{
+    rt_strncpy(g_last_command, command, sizeof(g_last_command) - 1);
+    g_last_command[sizeof(g_last_command) - 1] = '\0';
+}
+
+static const char *robot_get_body(const char *request)
+{
+    const char *body = strstr(request, "\r\n\r\n");
+
+    return body ? body + 4 : "";
+}
+
+static rt_bool_t robot_json_has(const char *body, const char *key)
+{
+    return strstr(body, key) != RT_NULL;
+}
+
+static int robot_exec_msh(const char *cmd)
+{
+#ifdef RT_USING_FINSH
+    extern long msh_exec(char *cmd, rt_size_t length);
+    char buffer[128];
+
+    rt_strncpy(buffer, cmd, sizeof(buffer) - 1);
+    buffer[sizeof(buffer) - 1] = '\0';
+
+    rt_kprintf("[robot] msh_exec: %s\n", buffer);
+    return (int)msh_exec(buffer, strlen(buffer));
+#else
+    rt_kprintf("[robot] FINSH/MSH is not enabled, cannot run: %s\n", cmd);
+    return -1;
+#endif
+}
+
+static void robot_handle_control(int client, const char *path)
+{
+    if (strcmp(path, "/control/start") == 0)
+    {
+        int ret;
+        robot_mark_command("start");
+        ret = vision_ipc_grab_start();
+        robot_send_json(client,
+                        ret == 0 ?
+                        "{\"ok\":true,\"command\":\"start\",\"message\":\"start accepted\"}" :
+                        "{\"ok\":false,\"command\":\"start\",\"error\":\"arm start failed\"}");
+        return;
+    }
+
+    if (strcmp(path, "/control/home") == 0)
+    {
+        robot_mark_command("home");
+        /* TODO: call real arm-control home/reset function here. */
+        robot_send_json(client, "{\"ok\":true,\"command\":\"home\",\"message\":\"home accepted\"}");
+        return;
+    }
+
+    if (strcmp(path, "/control/stop") == 0)
+    {
+        int ret;
+        robot_mark_command("stop");
+        ret = vision_ipc_grab_stop();
+        robot_send_json(client,
+                        ret == 0 ?
+                        "{\"ok\":true,\"command\":\"stop\",\"message\":\"stop accepted\"}" :
+                        "{\"ok\":false,\"command\":\"stop\",\"error\":\"arm stop failed\"}");
+        return;
+    }
+
+    if (strcmp(path, "/control/scan") == 0)
+    {
+        robot_mark_command("scan");
+        /* TODO: call vision scan/calibration function here. */
+        robot_send_json(client, "{\"ok\":true,\"command\":\"scan\",\"message\":\"scan accepted\"}");
+        return;
+    }
+
+    robot_send_response(client, "404 Not Found", "application/json", "{\"ok\":false,\"error\":\"unknown control\"}");
+}
+
+static void robot_send_arm_result(int client, const char *cmd, int ret, const char *message)
+{
+    char body[192];
+
+    if (ret == 0)
+    {
+        rt_snprintf(body,
+                    sizeof(body),
+                    "{\"ok\":true,\"cmd\":\"%s\",\"message\":\"%s\"}",
+                    cmd ? cmd : "",
+                    message ? message : "accepted");
+    }
+    else
+    {
+        rt_snprintf(body,
+                    sizeof(body),
+                    "{\"ok\":false,\"cmd\":\"%s\",\"error\":\"%s\"}",
+                    cmd ? cmd : "",
+                    message ? message : "command failed");
+    }
+
+    robot_send_json(client, body);
+}
+
+static void robot_extract_selected_target(const char *body)
+{
+    const char *p;
+
+    g_selected_target_id = 0;
+    g_selected_target_cx = -1;
+    g_selected_target_cy = -1;
+    g_selected_target_class[0] = '\0';
+
+    p = strstr(body, "\"id\":");
+    if (p)
+    {
+        g_selected_target_id = atoi(p + 5);
+    }
+
+    p = strstr(body, "\"cx\":");
+    if (p)
+    {
+        g_selected_target_cx = atoi(p + 5);
+    }
+
+    p = strstr(body, "\"cy\":");
+    if (p)
+    {
+        g_selected_target_cy = atoi(p + 5);
+    }
+
+    p = strstr(body, "\"class\":\"");
+    if (p)
+    {
+        const char *start = p + 9;
+        const char *end = strchr(start, '"');
+        size_t len;
+
+        if (end)
+        {
+            len = (size_t)(end - start);
+            if (len >= sizeof(g_selected_target_class))
+            {
+                len = sizeof(g_selected_target_class) - 1;
+            }
+            memcpy(g_selected_target_class, start, len);
+            g_selected_target_class[len] = '\0';
+        }
+    }
+
+    if ((g_selected_target_cx >= 0) && (g_selected_target_cy >= 0))
+    {
+        rt_kprintf("[M55 ARM] selected target id=%d class=%s cx=%d cy=%d\n",
+                   g_selected_target_id,
+                   g_selected_target_class[0] ? g_selected_target_class : "target",
+                   g_selected_target_cx,
+                   g_selected_target_cy);
+    }
+}
+
+static void robot_handle_arm_calibration(int client, const char *request)
+{
+    const char *body = robot_get_body(request);
+    int ret = -RT_ERROR;
+    const char *cmd = "unknown";
+    const char *message = "calibration command failed";
+
+    if (robot_json_has(body, "\"cmd\":\"start\""))
+    {
+        cmd = "start";
+        rt_kprintf("[robot] calibration start: enable local LCD camera preview\n");
+        robot_exec_msh("usbh_uvc_start 0 424 240");
+        ret = vision_ipc_armcal_start();
+        if (ret == 0) g_arm_calibrating = RT_TRUE;
+        message = ret == 0 ? "calibration started" : "calibration start failed";
+    }
+    else if (robot_json_has(body, "\"cmd\":\"record_tl\""))
+    {
+        cmd = "record_tl";
+        ret = vision_ipc_armcal_record_tl();
+        if (ret == 0) g_arm_corner_tl = RT_TRUE;
+        message = ret == 0 ? "calibration point saved" : "record tl failed";
+    }
+    else if (robot_json_has(body, "\"cmd\":\"record_tr\""))
+    {
+        cmd = "record_tr";
+        ret = vision_ipc_armcal_record_tr();
+        if (ret == 0) g_arm_corner_tr = RT_TRUE;
+        message = ret == 0 ? "calibration point saved" : "record tr failed";
+    }
+    else if (robot_json_has(body, "\"cmd\":\"record_bl\""))
+    {
+        cmd = "record_bl";
+        ret = vision_ipc_armcal_record_bl();
+        if (ret == 0) g_arm_corner_bl = RT_TRUE;
+        message = ret == 0 ? "calibration point saved" : "record bl failed";
+    }
+    else if (robot_json_has(body, "\"cmd\":\"record_br\""))
+    {
+        cmd = "record_br";
+        ret = vision_ipc_armcal_record_br();
+        if (ret == 0) g_arm_corner_br = RT_TRUE;
+        message = ret == 0 ? "calibration point saved" : "record br failed";
+    }
+    else if (robot_json_has(body, "\"cmd\":\"show\""))
+    {
+        cmd = "show";
+        ret = vision_ipc_armcal_show();
+        message = ret == 0 ? "calibration status requested" : "calibration show failed";
+    }
+    else if (robot_json_has(body, "\"cmd\":\"stop\""))
+    {
+        cmd = "stop";
+        ret = vision_ipc_armcal_stop();
+        if (ret == 0) g_arm_calibrating = RT_FALSE;
+        message = ret == 0 ? "calibration stopped" : "calibration stop failed";
+    }
+    else if (robot_json_has(body, "\"cmd\":\"exit_clear\""))
+    {
+        cmd = "exit_clear";
+        ret = vision_ipc_armcal_exit_clear();
+        message = ret == 0 ? "exit position cleared" : "exit clear failed";
+    }
+    else if (robot_json_has(body, "\"cmd\":\"exit_start\""))
+    {
+        cmd = "exit_start";
+        ret = vision_ipc_armcal_exit_start();
+        message = ret == 0 ? "exit position torque released" : "exit start failed";
+    }
+    else if (robot_json_has(body, "\"cmd\":\"exit\""))
+    {
+        cmd = "exit";
+        ret = vision_ipc_armcal_exit();
+        message = ret == 0 ? "exit position saved" : "exit position failed";
+    }
+
+    robot_mark_command(cmd);
+    robot_send_arm_result(client, cmd, ret, message);
+}
+
+static void robot_handle_arm_calibration_status(int client)
+{
+    char body[320];
+
+    rt_snprintf(body,
+                sizeof(body),
+                "{"
+                "\"ok\":true,"
+                "\"calibrating\":%s,"
+                "\"tl\":{\"valid\":%s},"
+                "\"tr\":{\"valid\":%s},"
+                "\"bl\":{\"valid\":%s},"
+                "\"br\":{\"valid\":%s}"
+                "}",
+                g_arm_calibrating ? "true" : "false",
+                g_arm_corner_tl ? "true" : "false",
+                g_arm_corner_tr ? "true" : "false",
+                g_arm_corner_bl ? "true" : "false",
+                g_arm_corner_br ? "true" : "false");
+
+    robot_send_json(client, body);
+}
+
+static void robot_handle_arm_grab(int client, const char *request)
+{
+    const char *body = robot_get_body(request);
+    int ret;
+
+    if (robot_json_has(body, "\"target\""))
+    {
+        robot_extract_selected_target(body);
+    }
+
+    if (robot_json_has(body, "\"cmd\":\"start\""))
+    {
+        robot_mark_command("grab_start");
+        rt_kprintf("[M55 ARM] grab_start called\n");
+        ret = vision_ipc_grab_start();
+        robot_send_arm_result(client, "start", ret, ret == 0 ? "grab command sent" : "grab start failed");
+        return;
+    }
+
+    if (robot_json_has(body, "\"cmd\":\"stop\""))
+    {
+        robot_mark_command("grab_stop");
+        ret = vision_ipc_grab_stop();
+        robot_send_arm_result(client, "stop", ret, ret == 0 ? "grab stopped" : "grab stop failed");
+        return;
+    }
+
+    robot_send_response(client, "400 Bad Request", "application/json",
+                        "{\"ok\":false,\"error\":\"unknown grab cmd\"}");
+}
+
+static void robot_handle_arm_light(int client, const char *request)
+{
+    const char *body = robot_get_body(request);
+    int ret;
+
+    if (robot_json_has(body, "\"cmd\":\"on\""))
+    {
+        robot_mark_command("light_on");
+        ret = vision_ipc_arm_light_on();
+        robot_send_arm_result(client, "on", ret, ret == 0 ? "light on" : "light on failed");
+        return;
+    }
+
+    if (robot_json_has(body, "\"cmd\":\"off\""))
+    {
+        robot_mark_command("light_off");
+        ret = vision_ipc_arm_light_off();
+        robot_send_arm_result(client, "off", ret, ret == 0 ? "light off" : "light off failed");
+        return;
+    }
+
+    robot_send_response(client, "400 Bad Request", "application/json",
+                        "{\"ok\":false,\"error\":\"unknown light cmd\"}");
+}
+
+static void robot_handle_arm(int client, const char *path, const char *request)
+{
+    if (strcmp(path, "/arm/calibration") == 0)
+    {
+        robot_handle_arm_calibration(client, request);
+        return;
+    }
+
+    if (strcmp(path, "/arm/grab") == 0)
+    {
+        robot_handle_arm_grab(client, request);
+        return;
+    }
+
+    if (strcmp(path, "/arm/light") == 0)
+    {
+        robot_handle_arm_light(client, request);
+        return;
+    }
+
+    robot_send_response(client, "404 Not Found", "application/json", "{\"ok\":false,\"error\":\"unknown arm path\"}");
+}
+
+static void robot_handle_vision(int client, const char *request)
+{
+    const char *body = robot_get_body(request);
+
+    if (robot_json_has(body, "vision_bootstrap"))
+    {
+        robot_mark_command("vision_bootstrap");
+        robot_exec_msh("usbh_init");
+        robot_exec_msh("lsusb");
+        robot_exec_msh("usbh_uvc_start 0 424 240");
+        robot_exec_msh("uvc_ai_bg_reset");
+        robot_exec_msh("uvc_ai_bg_auto 1");
+        robot_send_json(client,
+                        "{\"ok\":true,\"cmd\":\"vision_bootstrap\","
+                        "\"fmt\":0,\"width\":424,\"height\":240,"
+                        "\"background\":\"auto\"}");
+        return;
+    }
+
+    if (robot_json_has(body, "start_camera") ||
+        robot_json_has(body, "启动摄像头") ||
+        robot_json_has(body, "启动视觉"))
+    {
+        robot_mark_command("vision_start");
+        robot_exec_msh("usbh_init");
+        robot_exec_msh("lsusb");
+        robot_exec_msh("usbh_uvc_start 0 424 240");
+        robot_send_json(client, "{\"ok\":true,\"cmd\":\"start_camera\",\"fmt\":0,\"width\":424,\"height\":240}");
+        return;
+    }
+
+    if (robot_json_has(body, "stop_camera") ||
+        robot_json_has(body, "停止视觉") ||
+        robot_json_has(body, "停止摄像头"))
+    {
+        robot_mark_command("vision_stop");
+        robot_exec_msh("usbh_uvc_stop");
+        robot_send_json(client, "{\"ok\":true,\"cmd\":\"stop_camera\"}");
+        return;
+    }
+
+    if (robot_json_has(body, "set_resolution") ||
+        robot_json_has(body, "切换分辨率"))
+    {
+        robot_mark_command("set_resolution");
+        robot_exec_msh("usbh_uvc_stop");
+        robot_exec_msh("usbh_uvc_start 0 424 240");
+        robot_send_json(client, "{\"ok\":true,\"cmd\":\"set_resolution\",\"fmt\":0,\"width\":424,\"height\":240}");
+        return;
+    }
+
+    if (robot_json_has(body, "bg_reset") ||
+        robot_json_has(body, "重采样背景") ||
+        robot_json_has(body, "重置背景"))
+    {
+        robot_mark_command("bg_reset");
+        robot_exec_msh("uvc_ai_bg_reset");
+        robot_send_json(client, "{\"ok\":true,\"cmd\":\"bg_reset\"}");
+        return;
+    }
+
+    if (robot_json_has(body, "bg_auto") ||
+        robot_json_has(body, "自动背景"))
+    {
+        robot_mark_command("bg_auto");
+
+        if (robot_json_has(body, "\"enable\":true") ||
+            robot_json_has(body, "enable:true") ||
+            robot_json_has(body, "自动背景"))
+        {
+            robot_exec_msh("uvc_ai_bg_auto 1");
+            robot_send_json(client, "{\"ok\":true,\"cmd\":\"bg_auto\",\"enable\":true}");
+        }
+        else
+        {
+            robot_exec_msh("uvc_ai_bg_auto 0");
+            robot_send_json(client, "{\"ok\":true,\"cmd\":\"bg_auto\",\"enable\":false}");
+        }
+
+        return;
+    }
+
+    if (robot_json_has(body, "set_dark_threshold") ||
+        robot_json_has(body, "低误检") ||
+        robot_json_has(body, "默认") ||
+        robot_json_has(body, "高灵敏"))
+    {
+        robot_mark_command("dark_threshold");
+
+        if (robot_json_has(body, "\"value\":95"))
+        {
+            robot_exec_msh("uvc_ai_dark_threshold 95");
+            robot_send_json(client, "{\"ok\":true,\"cmd\":\"set_dark_threshold\",\"value\":95}");
+        }
+        else if (robot_json_has(body, "\"value\":135"))
+        {
+            robot_exec_msh("uvc_ai_dark_threshold 135");
+            robot_send_json(client, "{\"ok\":true,\"cmd\":\"set_dark_threshold\",\"value\":135}");
+        }
+        else
+        {
+            robot_exec_msh("uvc_ai_dark_threshold 115");
+            robot_send_json(client, "{\"ok\":true,\"cmd\":\"set_dark_threshold\",\"value\":115}");
+        }
+
+        return;
+    }
+
+    if (robot_json_has(body, "refresh_frame") ||
+        robot_json_has(body, "刷新画面"))
+    {
+        robot_mark_command("refresh_frame");
+        robot_send_json(client,
+                        "{"
+                        "\"ok\":true,"
+                        "\"cmd\":\"refresh_frame\","
+                        "\"message\":\"camera frame endpoint reserved\""
+                        "}");
+        return;
+    }
+
+    if (robot_json_has(body, "read_vision_result") ||
+        robot_json_has(body, "读取结果") ||
+        robot_json_has(body, "显示坐标"))
+    {
+        robot_mark_command("read_vision_result");
+        robot_handle_vision_result(client);
+        return;
+    }
+
+    robot_send_response(client, "400 Bad Request", "application/json",
+                        "{\"ok\":false,\"error\":\"unknown vision cmd\"}");
+}
+
+static void robot_handle_voice(int client, const char *request)
+{
+    const char *body = robot_get_body(request);
+    char response[256];
+
+    if (robot_json_has(body, "start_listening"))
+    {
+        g_voice_listening = RT_TRUE;
+        robot_mark_command("voice_start_listening");
+        robot_send_json(client,
+                        "{"
+                        "\"ok\":true,"
+                        "\"cmd\":\"start_listening\","
+                        "\"listening\":true"
+                        "}");
+        return;
+    }
+
+    if (robot_json_has(body, "stop_listening"))
+    {
+        g_voice_listening = RT_FALSE;
+        robot_mark_command("voice_stop_listening");
+        robot_send_json(client,
+                        "{"
+                        "\"ok\":true,"
+                        "\"cmd\":\"stop_listening\","
+                        "\"listening\":false"
+                        "}");
+        return;
+    }
+
+    if (robot_json_has(body, "read_voice_result"))
+    {
+        robot_mark_command("voice_read_result");
+
+        /*
+         * Placeholder for a future board-side speech module.
+         * When real recognition is integrated, fill g_board_voice_text and
+         * increment g_board_voice_seq only when a new command is ready.
+         */
+        if (g_board_voice_text[0] != '\0')
+        {
+            rt_snprintf(response,
+                        sizeof(response),
+                        "{"
+                        "\"ok\":true,"
+                        "\"hasResult\":true,"
+                        "\"seq\":%d,"
+                        "\"text\":\"%s\","
+                        "\"source\":\"board\""
+                        "}",
+                        g_board_voice_seq,
+                        g_board_voice_text);
+            g_board_voice_text[0] = '\0';
+            robot_send_json(client, response);
+            return;
+        }
+
+        robot_send_json(client,
+                        "{"
+                        "\"ok\":true,"
+                        "\"hasResult\":false"
+                        "}");
+        return;
+    }
+
+    robot_send_response(client, "400 Bad Request", "application/json",
+                        "{\"ok\":false,\"error\":\"unknown voice cmd\"}");
+}
+
+static void robot_handle_feature(int client, const char *path, const char *request)
+{
+    if (strcmp(path, "/feature/vision") == 0)
+    {
+        robot_handle_vision(client, request);
+        return;
+    }
+
+    if (strcmp(path, "/feature/voice") == 0)
+    {
+        robot_handle_voice(client, request);
+        return;
+    }
+
+    if (strcmp(path, "/feature/memory") == 0)
+    {
+        robot_mark_command("feature_memory");
+        robot_send_json(client, "{\"ok\":true,\"feature\":\"memory\",\"status\":\"reserved\"}");
+        return;
+    }
+
+    robot_send_response(client, "404 Not Found", "application/json", "{\"ok\":false,\"error\":\"unknown feature\"}");
+}
+
+static void robot_handle_plan(int client, const char *request)
+{
+    robot_save_plan_body(request);
+    robot_mark_command("plan_sync");
+
+    /*
+     * g_plan_json now contains the APP-side plan table, for example:
+     * {
+     *   "plans": [
+     *     {
+     *       "time": "08:30",
+     *       "repeat": "工作日",
+     *       "mode": "自动整理",
+     *       "areas": ["键盘区域"],
+     *       "enabled": true
+     *     }
+     *   ]
+     * }
+     *
+     * TODO: parse and store it into RT-Thread DFS / Flash when storage is ready.
+     */
+    robot_send_json(client, "{\"ok\":true,\"message\":\"plan saved\"}");
+}
+
+static void robot_handle_history(int client)
+{
+    char body[256];
+
+    rt_snprintf(body, sizeof(body),
+                "{\"ok\":true,\"history\":[{\"command\":\"%s\",\"status\":\"accepted\"}]}",
+                g_last_command);
+    robot_send_json(client, body);
+}
+
+static void robot_handle_client(int client)
+{
+    char request[ROBOT_HTTP_RECV_SIZE];
+    char method[8] = {0};
+    char path[96] = {0};
+    int received;
+
+    received = recv(client, request, sizeof(request) - 1, 0);
+    if (received <= 0)
+    {
+        closesocket(client);
+        return;
+    }
+    request[received] = '\0';
+
+    sscanf(request, "%7s %95s", method, path);
+    rt_kprintf("[robot] HTTP request: %s %s\n", method, path);
+
+    if (strcmp(method, "OPTIONS") == 0)
+    {
+        robot_send_response(client, "204 No Content", "text/plain", "");
+    }
+    else if (strcmp(method, "GET") == 0 && strcmp(path, "/status") == 0)
+    {
+        robot_handle_status(client);
+    }
+    else if (strcmp(method, "GET") == 0 && strcmp(path, "/") == 0)
+    {
+        robot_handle_status(client);
+    }
+    else if (strcmp(method, "GET") == 0 && strncmp(path, "/camera/frame", 13) == 0)
+    {
+        robot_handle_camera_frame(client, path);
+    }
+    else if (strcmp(method, "GET") == 0 && strcmp(path, "/arm/calibration/status") == 0)
+    {
+        robot_handle_arm_calibration_status(client);
+    }
+    else if (strcmp(method, "GET") == 0 && strcmp(path, "/history") == 0)
+    {
+        robot_handle_history(client);
+    }
+    else if (strcmp(method, "POST") == 0 && strncmp(path, "/control/", 9) == 0)
+    {
+        robot_handle_control(client, path);
+    }
+    else if (strcmp(method, "POST") == 0 && strncmp(path, "/feature/", 9) == 0)
+    {
+        robot_handle_feature(client, path, request);
+    }
+    else if (strcmp(method, "POST") == 0 && strncmp(path, "/arm/", 5) == 0)
+    {
+        robot_handle_arm(client, path, request);
+    }
+    else if (strcmp(method, "POST") == 0 && strcmp(path, "/plan") == 0)
+    {
+        robot_handle_plan(client, request);
+    }
+    else
+    {
+        robot_send_response(client, "404 Not Found", "application/json", "{\"ok\":false,\"error\":\"not found\"}");
+    }
+
+    rt_thread_mdelay(5);
+    closesocket(client);
+}
+
+#if 0
+static void robot_configure_ap_network(const char *if_name)
+{
+    struct netdev *netdev;
+    const char *netdev_name = if_name;
+    ip_addr_t ipaddr;
+    ip_addr_t netmask;
+    ip_addr_t gw;
+
+    netdev = robot_get_ap_netdev(if_name, &netdev_name);
+    if (!netdev)
+    {
+        rt_kprintf("[robot] AP netdev for %s not found, skip IP config\n", if_name);
+        return;
+    }
+
+    if (inet_aton(ROBOT_WIFI_AP_IP, &ipaddr))
+    {
+        netdev_set_ipaddr(netdev, &ipaddr);
+    }
+    if (inet_aton(ROBOT_WIFI_AP_NETMASK, &netmask))
+    {
+        netdev_set_netmask(netdev, &netmask);
+    }
+    if (inet_aton(ROBOT_WIFI_AP_IP, &gw))
+    {
+        netdev_set_gw(netdev, &gw);
+    }
+
+    netdev_set_default(netdev);
+    rt_kprintf("[robot] AP netif %s IP: %s\n", netdev_name, ROBOT_WIFI_AP_IP);
+
+#ifdef LWIP_USING_DHCPD
+    dhcpd_start(netdev_name);
+    rt_kprintf("[robot] DHCP server started on %s\n", netdev_name);
+#else
+    rt_kprintf("[robot] DHCP server is disabled. Set client IP manually to 192.168.4.x\n");
+#endif
+}
+#endif
+
+static void robot_http_server_thread(void *parameter)
+{
+    int server;
+    struct sockaddr_in server_addr;
+
+    RT_UNUSED(parameter);
+
+    server = socket(AF_INET, SOCK_STREAM, 0);
+    if (server < 0)
+    {
+        rt_kprintf("[robot] socket create failed\n");
+        return;
+    }
+
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    server_addr.sin_port = htons(ROBOT_HTTP_PORT);
+
+    if (bind(server, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0)
+    {
+        rt_kprintf("[robot] bind port %d failed\n", ROBOT_HTTP_PORT);
+        closesocket(server);
+        return;
+    }
+
+    if (listen(server, 4) < 0)
+    {
+        rt_kprintf("[robot] listen failed\n");
+        closesocket(server);
+        return;
+    }
+
+    g_http_ready = RT_TRUE;
+    rt_kprintf("[robot] HTTP server started on port %d\n", ROBOT_HTTP_PORT);
+    rt_kprintf("[robot] HTTP server started. Use STA IP printed above.\n");
+    while (1)
+    {
+        int client = accept(server, RT_NULL, RT_NULL);
+        if (client >= 0)
+        {
+            rt_kprintf("[robot] HTTP client accepted\n");
+            robot_handle_client(client);
+        }
+    }
+}
+
+#if 0
+static rt_err_t robot_wifi_try_start_ap_on(const char *if_name)
+{
+    rt_err_t result;
+
+    rt_kprintf("[robot] trying AP interface: %s\n", if_name);
+
+    result = rt_wlan_set_mode(if_name, RT_WLAN_AP);
+    if (result != RT_EOK)
+    {
+        rt_kprintf("[robot] set AP mode failed on %s: %d\n", if_name, result);
+        return result;
+    }
+
+    result = rt_wlan_start_ap(ROBOT_WIFI_AP_SSID, ROBOT_WIFI_AP_PASSWORD);
+    if (result != RT_EOK)
+    {
+        rt_kprintf("[robot] start AP failed on %s: %d\n", if_name, result);
+        return result;
+    }
+
+    rt_kprintf("[robot] AP interface selected: %s\n", if_name);
+    return RT_EOK;
+}
+#endif
+
+static int robot_wifi_start_ap(void)
+{
+    rt_kprintf("[robot] ERROR: AP FUNCTION SHOULD NOT RUN\n");
+    return -RT_ERROR;
+}
+static int robot_wifi_start_sta(void)
+{
+    rt_err_t result;
+    struct netdev *netdev;
+    char ip[32] = "unknown";
+    const char *if_name = ROBOT_WIFI_STA_IF;
+    int i;
+
+    rt_kprintf("[robot] connecting Wi-Fi STA: %s\n", ROBOT_WIFI_STA_SSID);
+
+    result = rt_wlan_set_mode(if_name, RT_WLAN_STATION);
+    if (result != RT_EOK)
+    {
+        rt_kprintf("[robot] set STA mode failed on %s: %d\n", if_name, result);
+        return result;
+    }
+
+    result = rt_wlan_connect(ROBOT_WIFI_STA_SSID, ROBOT_WIFI_STA_PASSWORD);
+    if (result != RT_EOK)
+    {
+        rt_kprintf("[robot] connect Wi-Fi returned warning: %d, continue to check IP\n", result);
+    }
+    else
+    {
+        rt_kprintf("[robot] connect Wi-Fi command accepted\n");
+    }
+
+    rt_kprintf("[robot] waiting for DHCP IP...\n");
+
+    for (i = 0; i < 20; i++)
+    {
+        netdev = netdev_get_by_name("w0");
+        if (!netdev)
+        {
+            netdev = netdev_get_by_name(if_name);
+        }
+
+        if (netdev)
+        {
+            if (!netdev_is_dhcp_enabled(netdev))
+            {
+                rt_kprintf("[robot] DHCP is disabled on %s, enabling...\n", netdev->name);
+                (void)netdev_dhcp_enabled(netdev, RT_TRUE);
+            }
+
+            inet_ntoa_r(netdev->ip_addr, ip, sizeof(ip));
+
+            rt_kprintf("[robot] DHCP check %d: ip=%s up=%d link=%d dhcp=%d\n",
+                       i,
+                       ip,
+                       netdev_is_up(netdev),
+                       netdev_is_link_up(netdev),
+                       netdev_is_dhcp_enabled(netdev));
+
+            if (strcmp(ip, "0.0.0.0") != 0 && strcmp(ip, "unknown") != 0)
+            {
+                rt_kprintf("[robot] STA IP: %s\n", ip);
+                rt_kprintf("[robot] APP status URL: http://%s/status\n", ip);
+                g_wifi_ready = RT_TRUE;
+                return RT_EOK;
+            }
+        }
+        else
+        {
+            rt_kprintf("[robot] STA netdev not found, waiting...\n");
+        }
+
+        rt_thread_mdelay(1000);
+    }
+
+    rt_kprintf("[robot] STA connected but no DHCP IP. Please check phone hotspot DHCP/client list.\n");
+    return -RT_ERROR;
+}
+int robot_app_bridge_start(void)
+{
+    rt_thread_t tid;
+
+    rt_kprintf("[robot] ===== NEW STA ENTRY =====\n");
+
+    if (g_bridge_started)
+    {
+        rt_kprintf("[robot] bridge already started\n");
+        return RT_EOK;
+    }
+
+    if (robot_wifi_start_sta() != RT_EOK)
+    {
+        return -RT_ERROR;
+    }
+    tid = rt_thread_create("robot_http",
+                           robot_http_server_thread,
+                           RT_NULL,
+                           8192,
+                           3,
+                           10);
+    if (tid)
+    {
+        rt_thread_startup(tid);
+        g_bridge_started = RT_TRUE;
+    }
+    else
+    {
+        rt_kprintf("[robot] create HTTP thread failed\n");
+        return -RT_ERROR;
+    }
+
+    return RT_EOK;
+}
+MSH_CMD_EXPORT(robot_app_bridge_start, start robot arm Wi-Fi STA and APP HTTP bridge);
+
+static int robot_net_status(int argc, char **argv)
+{
+    RT_UNUSED(argc);
+    RT_UNUSED(argv);
+
+    rt_kprintf("[robot] ===== APP bridge status =====\n");
+    rt_kprintf("[robot] bridge : %s\n", g_bridge_started ? "started" : "stopped");
+    rt_kprintf("[robot] wifi   : %s\n", g_wifi_ready ? "ready" : "not ready");
+    rt_kprintf("[robot] http   : %s\n", g_http_ready ? "ready" : "not ready");
+    rt_kprintf("[robot] sta ssid: %s\n", ROBOT_WIFI_STA_SSID);
+    rt_kprintf("[robot] sta if  : %s\n", ROBOT_WIFI_STA_IF);
+    rt_kprintf("[robot] last   : %s\n", g_last_command);
+    robot_print_netdev(ROBOT_WIFI_STA_IF);
+    robot_print_netdev(ROBOT_NETDEV_AP_IF);
+    if (strcmp(ROBOT_NETDEV_AP_IF, ROBOT_NETDEV_AP_IF_FALLBACK) != 0)
+    {
+        robot_print_netdev(ROBOT_NETDEV_AP_IF_FALLBACK);
+    }
+    rt_kprintf("[robot] =============================\n");
+
+    return 0;
+}
+MSH_CMD_EXPORT(robot_net_status, show robot arm Wi-Fi and HTTP bridge status);
+
+static void robot_app_bridge_auto_thread(void *parameter)
+{
+    RT_UNUSED(parameter);
+
+    rt_thread_mdelay(5000);
+    robot_app_bridge_start();
+}
+
+static int robot_app_bridge_auto_start(void)
+{
+    rt_thread_t tid;
+
+    tid = rt_thread_create("robot_auto",
+                           robot_app_bridge_auto_thread,
+                           RT_NULL,
+                           2048,
+                           25,
+                           10);
+    if (tid)
+    {
+        rt_thread_startup(tid);
+    }
+    else
+    {
+        rt_kprintf("[robot] create auto-start thread failed\n");
+    }
+
+    return RT_EOK;
+}
+INIT_APP_EXPORT(robot_app_bridge_auto_start);

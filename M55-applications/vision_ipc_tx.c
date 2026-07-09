@@ -1,0 +1,1359 @@
+#include <rtthread.h>
+#include <rtdevice.h>
+#include <string.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#include "vision_ipc_tx.h"
+
+#ifdef BSP_USING_IPC
+#include "drv_ipc.h"
+#endif
+
+/* Legacy / existing IPC messages. */
+#define VISION_IPC_MSG_PEN_COORD       0x5501U
+#define VISION_IPC_MSG_PEN_ACK         0x5502U
+#define VISION_IPC_MSG_ROARM_RX        0x5503U
+#define VISION_IPC_MSG_ROARM_TX        0x5504U
+#define VISION_IPC_MSG_M33_DBG         0x5505U
+#define VISION_IPC_MSG_ARM_TEST_QUERY  0x5506U
+#define VISION_IPC_MSG_SOFT_TX_ZERO    0x5507U
+
+/* Coordinate-conversion / grasp-control IPC message. */
+#define VISION_IPC_MSG_CAL_CMD         0x5510U
+
+#define CAL_CMD_BEGIN                  1U
+#define CAL_CMD_CAPTURE_TL             2U
+#define CAL_CMD_CAPTURE_TR             3U
+#define CAL_CMD_CAPTURE_BL             4U
+#define CAL_CMD_CAPTURE_BR             5U
+#define CAL_CMD_SHOW                   6U
+#define CAL_CMD_GRAB_START             7U
+#define CAL_CMD_GRAB_STOP              8U
+#define CAL_CMD_CAPTURE_EXIT           9U
+#define CAL_CMD_LIGHT_ON               10U
+#define CAL_CMD_LIGHT_OFF              11U
+#define CAL_CMD_CAL_STOP               12U
+#define CAL_CMD_EXIT_CLEAR             13U
+#define CAL_CMD_EXIT_BEGIN             14U
+#define CAL_CMD_ARM_HOME               15U
+#define CAL_CMD_PLACE_UNLOCK           16U
+#define CAL_CMD_PLACE_LOCK             17U
+#define CAL_CMD_PLACE_CLEAR            18U
+#define CAL_CMD_PLACE_SHOW             19U
+
+/* Send vision targets only while grab_start has been requested. */
+#define VISION_IPC_SEND_INTERVAL_MS    14000U
+#define VISION_PLACE_CATEGORY_MAX      7U
+#define VISION_SCORE_MASK              0x0FFFU
+#define VISION_CATEGORY_SHIFT          12U
+
+/* V2.1 target picker:
+ *   1) Prefer the smallest detected target.
+ *   2) Immediately after a pick, avoid targets close to the previous pick point
+ *      unless it is the only available target or all targets are close.
+ */
+#define VISION_PICK_NEAR_DIST_PX       52U
+
+/* V2.4 pick outcome verification / send pacing.
+ * After M55 sends one target, it waits about 14s and checks whether the same
+ * object still exists around the original image coordinate. While waiting,
+ * M55 does not send a second target, so M33/RoArm can finish pick/place/exit.
+ */
+#define VISION_PICK_VERIFY_DELAY_MS    14000U
+#define VISION_PICK_VERIFY_DIST_PX     34U
+#define VISION_PICK_NEIGHBOR_RADIUS_PX 58U
+#define VISION_PICK_SIZE_TOL_X100      35U
+
+#ifdef BSP_USING_IPC
+
+static rt_device_t g_vision_ipc_dev = RT_NULL;
+static rt_uint32_t g_vision_ipc_seq = 0;
+static rt_tick_t g_vision_last_send_tick = 0;
+static rt_thread_t g_vision_ipc_rx_tid = RT_NULL;
+static rt_uint8_t g_grab_stream_enabled = 0U;
+static rt_uint8_t g_last_pick_valid = 0U;
+static rt_uint16_t g_last_pick_cx = 0U;
+static rt_uint16_t g_last_pick_cy = 0U;
+
+typedef struct
+{
+    rt_uint8_t pending;
+    rt_uint32_t seq;
+    rt_tick_t sent_tick;
+    rt_uint16_t cx;
+    rt_uint16_t cy;
+    int16_t x1;
+    int16_t y1;
+    int16_t x2;
+    int16_t y2;
+    rt_uint32_t area;
+    rt_uint8_t class_id;
+    char class_name[UVC_AI_MAX_CLASS_LEN];
+    rt_uint8_t local_count;
+} vision_pick_verify_t;
+
+static vision_pick_verify_t g_pick_verify;
+
+static char g_roarm_rx_line[256];
+static rt_size_t g_roarm_rx_pos = 0;
+
+static char g_roarm_tx_line[256];
+static rt_size_t g_roarm_tx_pos = 0;
+
+static char g_m33_dbg_line[256];
+static rt_size_t g_m33_dbg_pos = 0;
+
+static int vision_ipc_open_once(void)
+{
+    if (g_vision_ipc_dev != RT_NULL)
+    {
+        return RT_EOK;
+    }
+
+    g_vision_ipc_dev = edge_ipc_device_find();
+
+    if (g_vision_ipc_dev == RT_NULL)
+    {
+        if (edge_ipc_device_register() != RT_EOK)
+        {
+            rt_kprintf("[M55 IPC] register failed\r\n");
+            return -RT_ERROR;
+        }
+
+        g_vision_ipc_dev = edge_ipc_device_find();
+        if (g_vision_ipc_dev == RT_NULL)
+        {
+            rt_kprintf("[M55 IPC] device not found\r\n");
+            return -RT_ERROR;
+        }
+    }
+
+    if (rt_device_open(g_vision_ipc_dev, RT_DEVICE_FLAG_RDWR) != RT_EOK)
+    {
+        rt_kprintf("[M55 IPC] open failed\r\n");
+        g_vision_ipc_dev = RT_NULL;
+        return -RT_ERROR;
+    }
+
+    rt_kprintf("[M55 IPC] opened\r\n");
+    return RT_EOK;
+}
+
+static rt_uint16_t clamp_u16_from_i16(int16_t v)
+{
+    if (v < 0)
+    {
+        return 0;
+    }
+
+    return (rt_uint16_t)v;
+}
+
+static rt_uint16_t conf_to_score_x1000(float conf)
+{
+    if (conf <= 0.0f)
+    {
+        return 0U;
+    }
+    if (conf >= 1.0f)
+    {
+        return 1000U;
+    }
+    return (rt_uint16_t)(conf * 1000.0f);
+}
+
+static rt_uint16_t vision_pack_score_category(rt_uint16_t score_x1000, rt_uint8_t category)
+{
+    if (score_x1000 > 1000U)
+    {
+        score_x1000 = 1000U;
+    }
+
+    if (category > VISION_PLACE_CATEGORY_MAX)
+    {
+        category = 0U;
+    }
+
+    return (rt_uint16_t)((score_x1000 & VISION_SCORE_MASK) |
+                         ((rt_uint16_t)category << VISION_CATEGORY_SHIFT));
+}
+
+static rt_uint32_t vision_bbox_area_i16(int16_t x1, int16_t y1, int16_t x2, int16_t y2)
+{
+    int32_t w;
+    int32_t h;
+
+    if (x1 > x2)
+    {
+        int16_t t = x1;
+        x1 = x2;
+        x2 = t;
+    }
+
+    if (y1 > y2)
+    {
+        int16_t t = y1;
+        y1 = y2;
+        y2 = t;
+    }
+
+    w = (int32_t)x2 - (int32_t)x1 + 1;
+    h = (int32_t)y2 - (int32_t)y1 + 1;
+
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+
+    return (rt_uint32_t)(w * h);
+}
+
+static rt_uint8_t vision_target_is_near_last(rt_uint16_t cx, rt_uint16_t cy)
+{
+    int32_t dx;
+    int32_t dy;
+    rt_uint32_t dist2;
+    rt_uint32_t limit2;
+
+    if (!g_last_pick_valid)
+    {
+        return 0U;
+    }
+
+    dx = (int32_t)cx - (int32_t)g_last_pick_cx;
+    dy = (int32_t)cy - (int32_t)g_last_pick_cy;
+
+    dist2 = (rt_uint32_t)(dx * dx + dy * dy);
+    limit2 = (rt_uint32_t)VISION_PICK_NEAR_DIST_PX * (rt_uint32_t)VISION_PICK_NEAR_DIST_PX;
+
+    return (dist2 <= limit2) ? 1U : 0U;
+}
+
+
+static rt_uint32_t vision_dist2_u16(rt_uint16_t ax, rt_uint16_t ay, rt_uint16_t bx, rt_uint16_t by)
+{
+    int32_t dx = (int32_t)ax - (int32_t)bx;
+    int32_t dy = (int32_t)ay - (int32_t)by;
+    return (rt_uint32_t)(dx * dx + dy * dy);
+}
+
+static rt_uint8_t vision_area_similar_x100(rt_uint32_t a, rt_uint32_t b, rt_uint32_t tol_x100)
+{
+    rt_uint32_t big;
+    rt_uint32_t small;
+    rt_uint32_t diff;
+
+    if ((a == 0U) || (b == 0U))
+    {
+        return 0U;
+    }
+
+    big = (a >= b) ? a : b;
+    small = (a >= b) ? b : a;
+    diff = big - small;
+
+    return ((diff * 100U) <= (small * tol_x100)) ? 1U : 0U;
+}
+
+static void vision_get_bbox_center(const uvc_ai_result_t *result,
+                                   rt_uint8_t idx,
+                                   int16_t *out_x1,
+                                   int16_t *out_y1,
+                                   int16_t *out_x2,
+                                   int16_t *out_y2,
+                                   rt_uint16_t *out_cx,
+                                   rt_uint16_t *out_cy,
+                                   rt_uint32_t *out_area)
+{
+    int16_t x1, y1, x2, y2;
+
+    x1 = result->bbox_int16[idx * 4U + 0U];
+    y1 = result->bbox_int16[idx * 4U + 1U];
+    x2 = result->bbox_int16[idx * 4U + 2U];
+    y2 = result->bbox_int16[idx * 4U + 3U];
+
+    if (x1 > x2)
+    {
+        int16_t t = x1;
+        x1 = x2;
+        x2 = t;
+    }
+
+    if (y1 > y2)
+    {
+        int16_t t = y1;
+        y1 = y2;
+        y2 = t;
+    }
+
+    if (out_x1 != RT_NULL) *out_x1 = x1;
+    if (out_y1 != RT_NULL) *out_y1 = y1;
+    if (out_x2 != RT_NULL) *out_x2 = x2;
+    if (out_y2 != RT_NULL) *out_y2 = y2;
+    if (out_cx != RT_NULL) *out_cx = clamp_u16_from_i16((int16_t)((x1 + x2) / 2));
+    if (out_cy != RT_NULL) *out_cy = clamp_u16_from_i16((int16_t)((y1 + y2) / 2));
+    if (out_area != RT_NULL) *out_area = vision_bbox_area_i16(x1, y1, x2, y2);
+}
+
+
+static rt_uint8_t vision_count_near_targets(const uvc_ai_result_t *result,
+                                            rt_uint16_t ref_cx,
+                                            rt_uint16_t ref_cy,
+                                            rt_uint16_t radius_px)
+{
+    rt_uint8_t i;
+    rt_uint8_t count;
+    rt_uint8_t near_count = 0U;
+    rt_uint32_t limit2;
+
+    if ((result == RT_NULL) || (!result->valid) || (result->count == 0U))
+    {
+        return 0U;
+    }
+
+    count = result->count;
+    if (count > UVC_AI_MAX_PREDICTIONS)
+    {
+        count = UVC_AI_MAX_PREDICTIONS;
+    }
+
+    limit2 = (rt_uint32_t)radius_px * (rt_uint32_t)radius_px;
+
+    for (i = 0U; i < count; i++)
+    {
+        rt_uint16_t cx, cy;
+        vision_get_bbox_center(result, i, RT_NULL, RT_NULL, RT_NULL, RT_NULL, &cx, &cy, RT_NULL);
+        if (vision_dist2_u16(cx, cy, ref_cx, ref_cy) <= limit2)
+        {
+            near_count++;
+        }
+    }
+
+    return near_count;
+}
+
+static rt_uint8_t vision_find_same_target_near_ref(const uvc_ai_result_t *result)
+{
+    rt_uint8_t i;
+    rt_uint8_t count;
+    rt_uint32_t dist_limit2;
+
+    if ((!g_pick_verify.pending) || (result == RT_NULL) || (!result->valid) || (result->count == 0U))
+    {
+        return 0U;
+    }
+
+    count = result->count;
+    if (count > UVC_AI_MAX_PREDICTIONS)
+    {
+        count = UVC_AI_MAX_PREDICTIONS;
+    }
+
+    dist_limit2 = (rt_uint32_t)VISION_PICK_VERIFY_DIST_PX * (rt_uint32_t)VISION_PICK_VERIFY_DIST_PX;
+
+    for (i = 0U; i < count; i++)
+    {
+        rt_uint16_t cx, cy;
+        rt_uint32_t area;
+        vision_get_bbox_center(result, i, RT_NULL, RT_NULL, RT_NULL, RT_NULL, &cx, &cy, &area);
+
+        if (vision_dist2_u16(cx, cy, g_pick_verify.cx, g_pick_verify.cy) > dist_limit2)
+        {
+            continue;
+        }
+
+        if (!vision_area_similar_x100(area, g_pick_verify.area, VISION_PICK_SIZE_TOL_X100))
+        {
+            continue;
+        }
+
+        return 1U;
+    }
+
+    return 0U;
+}
+
+static void vision_pick_verify_clear(void)
+{
+    memset(&g_pick_verify, 0, sizeof(g_pick_verify));
+}
+
+static void vision_pick_verify_arm(const uvc_ai_result_t *result, rt_uint8_t idx, rt_uint32_t seq)
+{
+    if ((result == RT_NULL) || (idx >= UVC_AI_MAX_PREDICTIONS))
+    {
+        return;
+    }
+
+    memset(&g_pick_verify, 0, sizeof(g_pick_verify));
+    g_pick_verify.pending = 1U;
+    g_pick_verify.seq = seq;
+    g_pick_verify.sent_tick = rt_tick_get();
+    g_pick_verify.class_id = result->class_id[idx];
+
+    vision_get_bbox_center(result,
+                           idx,
+                           &g_pick_verify.x1,
+                           &g_pick_verify.y1,
+                           &g_pick_verify.x2,
+                           &g_pick_verify.y2,
+                           &g_pick_verify.cx,
+                           &g_pick_verify.cy,
+                           &g_pick_verify.area);
+
+    strncpy(g_pick_verify.class_name, result->class_string[idx], sizeof(g_pick_verify.class_name) - 1U);
+    g_pick_verify.class_name[sizeof(g_pick_verify.class_name) - 1U] = '\0';
+
+    g_pick_verify.local_count = vision_count_near_targets(result,
+                                                          g_pick_verify.cx,
+                                                          g_pick_verify.cy,
+                                                          VISION_PICK_NEIGHBOR_RADIUS_PX);
+}
+
+static void vision_pick_verify_update(const uvc_ai_result_t *result)
+{
+    rt_tick_t now;
+    rt_tick_t delay_ticks;
+    rt_uint8_t now_local_count;
+    rt_uint8_t same_target_still_here;
+    rt_uint8_t success;
+
+    if (!g_pick_verify.pending)
+    {
+        return;
+    }
+
+    now = rt_tick_get();
+    delay_ticks = (VISION_PICK_VERIFY_DELAY_MS * RT_TICK_PER_SECOND) / 1000U;
+    if (delay_ticks == 0U) delay_ticks = 1U;
+
+    if ((now - g_pick_verify.sent_tick) < delay_ticks)
+    {
+        return;
+    }
+
+    now_local_count = vision_count_near_targets(result,
+                                                g_pick_verify.cx,
+                                                g_pick_verify.cy,
+                                                VISION_PICK_NEIGHBOR_RADIUS_PX);
+    same_target_still_here = vision_find_same_target_near_ref(result);
+
+    /* Failure: the same object is still near the old coordinate and the local
+     * target count did not decrease. Otherwise treat as success. This also
+     * handles crowded scenes: if the local count drops by one, the target was
+     * probably removed even if neighboring objects remain close.
+     */
+    success = (same_target_still_here && (now_local_count >= g_pick_verify.local_count)) ? 0U : 1U;
+
+    rt_kprintf("[M55 VERIFY] %s: %s at pixel=(%u,%u) bbox=[%d,%d,%d,%d] old_near=%u new_near=%u seq=%lu\r\n",
+               success ? "SUCCESS" : "FAILED",
+               g_pick_verify.class_name,
+               g_pick_verify.cx,
+               g_pick_verify.cy,
+               g_pick_verify.x1,
+               g_pick_verify.y1,
+               g_pick_verify.x2,
+               g_pick_verify.y2,
+               g_pick_verify.local_count,
+               now_local_count,
+               (unsigned long)g_pick_verify.seq);
+
+    vision_pick_verify_clear();
+}
+
+static rt_uint8_t vision_pick_best_index(const uvc_ai_result_t *result)
+{
+    rt_uint8_t i;
+    rt_uint8_t count;
+    rt_uint8_t best = 0U;
+    rt_uint8_t best_non_near = 0U;
+    rt_uint8_t have_non_near = 0U;
+    rt_uint32_t best_area = 0xFFFFFFFFUL;
+    rt_uint32_t best_non_near_area = 0xFFFFFFFFUL;
+
+    if ((result == RT_NULL) || (result->count == 0U))
+    {
+        return 0U;
+    }
+
+    count = result->count;
+    if (count > UVC_AI_MAX_PREDICTIONS)
+    {
+        count = UVC_AI_MAX_PREDICTIONS;
+    }
+
+    for (i = 0U; i < count; i++)
+    {
+        rt_uint16_t cx, cy;
+        rt_uint32_t area;
+        rt_uint8_t near_last;
+
+        vision_get_bbox_center(result, i, RT_NULL, RT_NULL, RT_NULL, RT_NULL, &cx, &cy, &area);
+        near_last = vision_target_is_near_last(cx, cy);
+
+        /* Primary rule: smallest area. Confidence only breaks very close ties. */
+        if ((area < best_area) ||
+            ((area <= best_area + 80U) && (result->conf[i] > result->conf[best])))
+        {
+            best_area = area;
+            best = i;
+        }
+
+        if (!near_last)
+        {
+            if ((!have_non_near) ||
+                (area < best_non_near_area) ||
+                ((area <= best_non_near_area + 80U) && (result->conf[i] > result->conf[best_non_near])))
+            {
+                have_non_near = 1U;
+                best_non_near_area = area;
+                best_non_near = i;
+            }
+        }
+    }
+
+    if (g_last_pick_valid && (count > 1U) && have_non_near)
+    {
+        return best_non_near;
+    }
+
+    return best;
+}
+
+static void append_ipc_text_chunk(char *line_buf,
+                                  rt_size_t *pos,
+                                  rt_size_t cap,
+                                  const edge_rc_frame_t *frame,
+                                  const char *tag)
+{
+    rt_uint16_t meta;
+    rt_uint16_t len;
+    rt_uint8_t final_chunk;
+    rt_uint16_t i;
+
+    if ((line_buf == RT_NULL) || (pos == RT_NULL) || (frame == RT_NULL) || (tag == RT_NULL))
+    {
+        return;
+    }
+
+    meta = frame->channel[1];
+    len = frame->channel[2];
+    final_chunk = (meta & 0x8000U) ? 1U : 0U;
+
+    if (len > 10U)
+    {
+        len = 10U;
+    }
+
+    for (i = 0; i < len; i++)
+    {
+        rt_uint16_t packed = frame->channel[3 + (i / 2U)];
+        char ch;
+
+        if ((i & 1U) == 0U)
+        {
+            ch = (char)(packed & 0xFFU);
+        }
+        else
+        {
+            ch = (char)((packed >> 8) & 0xFFU);
+        }
+
+        if (*pos < (cap - 1U))
+        {
+            line_buf[(*pos)++] = ch;
+        }
+    }
+
+    if (final_chunk)
+    {
+        line_buf[*pos] = '\0';
+        rt_kprintf("%s %s\r\n", tag, line_buf);
+        *pos = 0U;
+        memset(line_buf, 0, cap);
+    }
+}
+
+static void vision_ipc_rx_thread_entry(void *parameter)
+{
+    edge_rc_frame_t frame;
+
+    (void)parameter;
+
+    while (1)
+    {
+        if (vision_ipc_open_once() != RT_EOK)
+        {
+            rt_thread_mdelay(1000);
+            continue;
+        }
+
+        memset(&frame, 0, sizeof(frame));
+
+        if (rt_device_read(g_vision_ipc_dev, 0, &frame, 1) == 1)
+        {
+            if (frame.channel[0] == VISION_IPC_MSG_PEN_ACK)
+            {
+                rt_kprintf("[M55] M33 ACK: seq=%lu cx=%u cy=%u score=%u status=%u\r\n",
+                           (unsigned long)frame.seq,
+                           frame.channel[1],
+                           frame.channel[2],
+                           frame.channel[3],
+                           frame.channel[4]);
+            }
+            else if (frame.channel[0] == VISION_IPC_MSG_ROARM_TX)
+            {
+                append_ipc_text_chunk(g_roarm_tx_line,
+                                      &g_roarm_tx_pos,
+                                      sizeof(g_roarm_tx_line),
+                                      &frame,
+                                      "[M55] ARM UART TX:");
+            }
+            else if (frame.channel[0] == VISION_IPC_MSG_ROARM_RX)
+            {
+                append_ipc_text_chunk(g_roarm_rx_line,
+                                      &g_roarm_rx_pos,
+                                      sizeof(g_roarm_rx_line),
+                                      &frame,
+                                      "[M55] ARM UART RX:");
+            }
+            else if (frame.channel[0] == VISION_IPC_MSG_M33_DBG)
+            {
+                append_ipc_text_chunk(g_m33_dbg_line,
+                                      &g_m33_dbg_pos,
+                                      sizeof(g_m33_dbg_line),
+                                      &frame,
+                                      "[M55] M33 DBG:");
+            }
+        }
+        else
+        {
+            rt_thread_mdelay(20);
+        }
+    }
+}
+
+int vision_ipc_rx_monitor_start(void)
+{
+    if (g_vision_ipc_rx_tid != RT_NULL)
+    {
+        return RT_EOK;
+    }
+
+    g_vision_ipc_rx_tid = rt_thread_create("ipc_mon",
+                                           vision_ipc_rx_thread_entry,
+                                           RT_NULL,
+                                           2048,
+                                           19,
+                                           10);
+
+    if (g_vision_ipc_rx_tid == RT_NULL)
+    {
+        rt_kprintf("[M55 IPC] create monitor thread failed\r\n");
+        return -RT_ERROR;
+    }
+
+    rt_thread_startup(g_vision_ipc_rx_tid);
+    return RT_EOK;
+}
+INIT_APP_EXPORT(vision_ipc_rx_monitor_start);
+
+#endif /* BSP_USING_IPC */
+
+int vision_ipc_grab_stream_enabled(void)
+{
+#ifdef BSP_USING_IPC
+    return g_grab_stream_enabled ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+#ifdef BSP_USING_IPC
+static int vision_ipc_send_cal_cmd(rt_uint16_t subcmd, const char *name)
+{
+    edge_rc_frame_t frame;
+
+    if (vision_ipc_open_once() != RT_EOK)
+    {
+        rt_kprintf("[M55 %s] IPC open failed\r\n", name ? name : "calcmd");
+        return -RT_ERROR;
+    }
+
+    memset(&frame, 0, sizeof(frame));
+    frame.role = RC_ROLE_M55_ECHO;
+    frame.seq = ++g_vision_ipc_seq;
+    frame.channel[0] = VISION_IPC_MSG_CAL_CMD;
+    frame.channel[1] = subcmd;
+
+    if (rt_device_write(g_vision_ipc_dev, 0, &frame, 1) == 1)
+    {
+        rt_kprintf("[M55->M33] %s sent subcmd=%u seq=%lu\r\n",
+                   name ? name : "calcmd",
+                   subcmd,
+                   (unsigned long)frame.seq);
+        return 0;
+    }
+
+    rt_kprintf("[M55 %s] IPC write failed\r\n", name ? name : "calcmd");
+    return -RT_ERROR;
+}
+
+static int vision_ipc_send_cal_cmd_arg(rt_uint16_t subcmd, rt_uint16_t arg, const char *name)
+{
+    edge_rc_frame_t frame;
+
+    if (vision_ipc_open_once() != RT_EOK)
+    {
+        rt_kprintf("[M55 %s] IPC open failed\r\n", name ? name : "calcmd");
+        return -RT_ERROR;
+    }
+
+    memset(&frame, 0, sizeof(frame));
+    frame.role = RC_ROLE_M55_ECHO;
+    frame.seq = ++g_vision_ipc_seq;
+    frame.channel[0] = VISION_IPC_MSG_CAL_CMD;
+    frame.channel[1] = subcmd;
+    frame.channel[2] = arg;
+
+    if (rt_device_write(g_vision_ipc_dev, 0, &frame, 1) == 1)
+    {
+        rt_kprintf("[M55->M33] %s sent subcmd=%u arg=%u seq=%lu\r\n",
+                   name ? name : "calcmd",
+                   subcmd,
+                   arg,
+                   (unsigned long)frame.seq);
+        return 0;
+    }
+
+    rt_kprintf("[M55 %s] IPC write failed\r\n", name ? name : "calcmd");
+    return -RT_ERROR;
+}
+#endif
+
+int vision_ipc_armcal_start(void)
+{
+#ifdef BSP_USING_IPC
+    g_grab_stream_enabled = 0U;
+    g_vision_last_send_tick = 0U;
+    g_last_pick_valid = 0U;
+    vision_pick_verify_clear();
+    return vision_ipc_send_cal_cmd(CAL_CMD_BEGIN, "armcal_start");
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_armcal_record_tl(void)
+{
+#ifdef BSP_USING_IPC
+    return vision_ipc_send_cal_cmd(CAL_CMD_CAPTURE_TL, "armcal_tl");
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_armcal_record_tr(void)
+{
+#ifdef BSP_USING_IPC
+    return vision_ipc_send_cal_cmd(CAL_CMD_CAPTURE_TR, "armcal_tr");
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_armcal_record_bl(void)
+{
+#ifdef BSP_USING_IPC
+    return vision_ipc_send_cal_cmd(CAL_CMD_CAPTURE_BL, "armcal_bl");
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_armcal_record_br(void)
+{
+#ifdef BSP_USING_IPC
+    return vision_ipc_send_cal_cmd(CAL_CMD_CAPTURE_BR, "armcal_br");
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_armcal_show(void)
+{
+#ifdef BSP_USING_IPC
+    return vision_ipc_send_cal_cmd(CAL_CMD_SHOW, "armcal_show");
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_armcal_stop(void)
+{
+#ifdef BSP_USING_IPC
+    g_grab_stream_enabled = 0U;
+    g_vision_last_send_tick = 0U;
+    g_last_pick_valid = 0U;
+    vision_pick_verify_clear();
+    return vision_ipc_send_cal_cmd(CAL_CMD_CAL_STOP, "armcal_stop");
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_armcal_exit(void)
+{
+#ifdef BSP_USING_IPC
+    return vision_ipc_send_cal_cmd(CAL_CMD_CAPTURE_EXIT, "armcal_exit");
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_armcal_exit_start(void)
+{
+#ifdef BSP_USING_IPC
+    return vision_ipc_send_cal_cmd(CAL_CMD_EXIT_BEGIN, "armcal_exit_start");
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_armcal_exit_clear(void)
+{
+#ifdef BSP_USING_IPC
+    return vision_ipc_send_cal_cmd(CAL_CMD_EXIT_CLEAR, "armcal_exit_clear");
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_grab_start(void)
+{
+#ifdef BSP_USING_IPC
+    int ret;
+    g_grab_stream_enabled = 1U;
+    g_vision_last_send_tick = 0U;
+    g_last_pick_valid = 0U;
+    vision_pick_verify_clear();
+    rt_kprintf("[M55->M33 GRAB] send grab_enable/start\r\n");
+    ret = vision_ipc_send_cal_cmd(CAL_CMD_GRAB_START, "grab_start");
+    rt_kprintf("[M55 grab_start] V2.4 vision target streaming enabled, send interval=14s\r\n");
+    return ret;
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_grab_stop(void)
+{
+#ifdef BSP_USING_IPC
+    int ret;
+    g_grab_stream_enabled = 0U;
+    g_vision_last_send_tick = 0U;
+    g_last_pick_valid = 0U;
+    vision_pick_verify_clear();
+    ret = vision_ipc_send_cal_cmd(CAL_CMD_GRAB_STOP, "grab_stop");
+    rt_kprintf("[M55 grab_stop] vision target streaming disabled\r\n");
+    return ret;
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_send_selected_target(rt_uint16_t cx,
+                                    rt_uint16_t cy,
+                                    rt_uint16_t x1,
+                                    rt_uint16_t y1,
+                                    rt_uint16_t x2,
+                                    rt_uint16_t y2,
+                                    rt_uint16_t score_x1000,
+                                    const char *class_name,
+                                    int target_id,
+                                    int place_category)
+{
+#ifdef BSP_USING_IPC
+    edge_rc_frame_t frame;
+    rt_uint8_t category;
+    rt_tick_t now;
+    rt_tick_t interval_ticks;
+
+    now = rt_tick_get();
+    interval_ticks = (VISION_IPC_SEND_INTERVAL_MS * RT_TICK_PER_SECOND) / 1000U;
+    if (interval_ticks == 0U) interval_ticks = 1U;
+
+    if (g_pick_verify.pending)
+    {
+        rt_kprintf("[M55->M33 GRAB] selected target rejected: previous pick still in 14s verify/action window\r\n");
+        return -RT_EBUSY;
+    }
+
+    if ((g_vision_last_send_tick != 0U) &&
+        ((now - g_vision_last_send_tick) < interval_ticks))
+    {
+        rt_kprintf("[M55->M33 GRAB] selected target throttled: wait %lu ms between sends\r\n",
+                   (unsigned long)VISION_IPC_SEND_INTERVAL_MS);
+        return -RT_EBUSY;
+    }
+
+    if (vision_ipc_open_once() != RT_EOK)
+    {
+        rt_kprintf("[M55->M33 GRAB] IPC open failed\r\n");
+        return -RT_ERROR;
+    }
+
+    category = (place_category >= 0 && place_category <= (int)VISION_PLACE_CATEGORY_MAX) ?
+               (rt_uint8_t)place_category : 0U;
+
+    memset(&frame, 0, sizeof(frame));
+    frame.role = RC_ROLE_M55_ECHO;
+    frame.seq = ++g_vision_ipc_seq;
+    frame.channel[0] = VISION_IPC_MSG_PEN_COORD;
+    frame.channel[1] = cx;
+    frame.channel[2] = cy;
+    frame.channel[3] = x1;
+    frame.channel[4] = y1;
+    frame.channel[5] = x2;
+    frame.channel[6] = y2;
+    frame.channel[7] = vision_pack_score_category(score_x1000, category);
+
+    rt_kprintf("[M55->M33 GRAB] send selected target seq=%lu id=%d class=%s category=%u cx=%u cy=%u bbox=[%u,%u,%u,%u] score=%u\r\n",
+               (unsigned long)frame.seq,
+               target_id,
+               class_name ? class_name : "target",
+               category,
+               cx,
+               cy,
+               x1,
+               y1,
+               x2,
+               y2,
+               score_x1000);
+
+    if (rt_device_write(g_vision_ipc_dev, 0, &frame, 1) == 1)
+    {
+        g_vision_last_send_tick = now;
+        g_last_pick_valid = 1U;
+        g_last_pick_cx = cx;
+        g_last_pick_cy = cy;
+        vision_pick_verify_clear();
+        rt_kprintf("[M55->M33 GRAB] send ok\r\n");
+        return 0;
+    }
+
+    rt_kprintf("[M55->M33 GRAB] IPC write failed\r\n");
+    return -RT_ERROR;
+#else
+    (void)cx;
+    (void)cy;
+    (void)x1;
+    (void)y1;
+    (void)x2;
+    (void)y2;
+    (void)score_x1000;
+    (void)class_name;
+    (void)target_id;
+    (void)place_category;
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_arm_light_on(void)
+{
+#ifdef BSP_USING_IPC
+    return vision_ipc_send_cal_cmd(CAL_CMD_LIGHT_ON, "arm_light");
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_arm_light_off(void)
+{
+#ifdef BSP_USING_IPC
+    return vision_ipc_send_cal_cmd(CAL_CMD_LIGHT_OFF, "arm_light_off");
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_arm_home(void)
+{
+#ifdef BSP_USING_IPC
+    return vision_ipc_send_cal_cmd(CAL_CMD_ARM_HOME, "arm_home");
+#else
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_place_unlock(int category)
+{
+#ifdef BSP_USING_IPC
+    if (category < 0 || category > (int)VISION_PLACE_CATEGORY_MAX) category = 0;
+    return vision_ipc_send_cal_cmd_arg(CAL_CMD_PLACE_UNLOCK, (rt_uint16_t)category, "place_unlock");
+#else
+    (void)category;
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_place_lock(int category)
+{
+#ifdef BSP_USING_IPC
+    if (category < 0 || category > (int)VISION_PLACE_CATEGORY_MAX) category = 0;
+    return vision_ipc_send_cal_cmd_arg(CAL_CMD_PLACE_LOCK, (rt_uint16_t)category, "place_lock");
+#else
+    (void)category;
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_place_clear(int category)
+{
+#ifdef BSP_USING_IPC
+    if (category < 0 || category > (int)VISION_PLACE_CATEGORY_MAX) category = 0;
+    return vision_ipc_send_cal_cmd_arg(CAL_CMD_PLACE_CLEAR, (rt_uint16_t)category, "place_clear");
+#else
+    (void)category;
+    return -RT_ERROR;
+#endif
+}
+
+int vision_ipc_place_show(void)
+{
+#ifdef BSP_USING_IPC
+    return vision_ipc_send_cal_cmd(CAL_CMD_PLACE_SHOW, "place_show");
+#else
+    return -RT_ERROR;
+#endif
+}
+
+#ifdef FINSH_USING_MSH
+
+static int testarm(int argc, char **argv)
+{
+#ifdef BSP_USING_IPC
+    edge_rc_frame_t frame;
+
+    (void)argc;
+    (void)argv;
+
+    if (vision_ipc_open_once() != RT_EOK)
+    {
+        rt_kprintf("[M55 testarm] IPC open failed\r\n");
+        return -RT_ERROR;
+    }
+
+    memset(&frame, 0, sizeof(frame));
+
+    frame.role = RC_ROLE_M55_ECHO;
+    frame.seq = ++g_vision_ipc_seq;
+    frame.channel[0] = VISION_IPC_MSG_ARM_TEST_QUERY;
+
+    if (rt_device_write(g_vision_ipc_dev, 0, &frame, 1) == 1)
+    {
+        rt_kprintf("[M55 testarm] sent request to M33: send {\"T\":105} once\r\n");
+        return 0;
+    }
+
+    rt_kprintf("[M55 testarm] IPC write failed\r\n");
+    return -RT_ERROR;
+#else
+    (void)argc;
+    (void)argv;
+    rt_kprintf("[M55 testarm] BSP_USING_IPC disabled\r\n");
+    return -RT_ERROR;
+#endif
+}
+MSH_CMD_EXPORT(testarm, ask M33 to send one RoArm query command);
+
+static int testtx(int argc, char **argv)
+{
+#ifdef BSP_USING_IPC
+    edge_rc_frame_t frame;
+
+    (void)argc;
+    (void)argv;
+
+    if (vision_ipc_open_once() != RT_EOK)
+    {
+        rt_kprintf("[M55 testtx] IPC open failed\r\n");
+        return -RT_ERROR;
+    }
+
+    memset(&frame, 0, sizeof(frame));
+
+    frame.role = RC_ROLE_M55_ECHO;
+    frame.seq = ++g_vision_ipc_seq;
+    frame.channel[0] = VISION_IPC_MSG_SOFT_TX_ZERO;
+    frame.channel[1] = 0x0000U;
+
+    if (rt_device_write(g_vision_ipc_dev, 0, &frame, 1) == 1)
+    {
+        rt_kprintf("[M55 testtx] sent request to M33: soft TX one raw byte 0x00\r\n");
+        return 0;
+    }
+
+    rt_kprintf("[M55 testtx] IPC write failed\r\n");
+    return -RT_ERROR;
+#else
+    (void)argc;
+    (void)argv;
+    rt_kprintf("[M55 testtx] BSP_USING_IPC disabled\r\n");
+    return -RT_ERROR;
+#endif
+}
+MSH_CMD_EXPORT(testtx, ask M33 soft UART TX to send one raw byte 0x00);
+
+static int armcal_start(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_armcal_start();
+}
+MSH_CMD_EXPORT(armcal_start, start coordinate calibration and release RoArm torque);
+
+static int armcal_tl(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_armcal_record_tl();
+}
+MSH_CMD_EXPORT(armcal_tl, record camera top-left corner arm coordinate);
+
+static int armcal_tr(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_armcal_record_tr();
+}
+MSH_CMD_EXPORT(armcal_tr, record camera top-right corner arm coordinate);
+
+static int armcal_bl(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_armcal_record_bl();
+}
+MSH_CMD_EXPORT(armcal_bl, record camera bottom-left corner arm coordinate);
+
+static int armcal_br(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_armcal_record_br();
+}
+MSH_CMD_EXPORT(armcal_br, record camera bottom-right corner arm coordinate);
+
+static int armcal_show(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_armcal_show();
+}
+MSH_CMD_EXPORT(armcal_show, show M33 coordinate conversion parameters);
+
+static int armcal_exit(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_armcal_exit();
+}
+MSH_CMD_EXPORT(armcal_exit, record off-camera exit position for RoArm after each pick);
+
+static int armcal_exit_start(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_armcal_exit_start();
+}
+MSH_CMD_EXPORT(armcal_exit_start, release torque before recording off-camera exit position);
+
+static int arm_light(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_arm_light_on();
+}
+MSH_CMD_EXPORT(arm_light, turn on RoArm head light);
+
+static int arm_light_off(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_arm_light_off();
+}
+MSH_CMD_EXPORT(arm_light_off, turn off RoArm head light);
+
+static int arm_home(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_arm_home();
+}
+MSH_CMD_EXPORT(arm_home, ask M33 to send RoArm home command T=102);
+
+static int armcal_stop(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_armcal_stop();
+}
+MSH_CMD_EXPORT(armcal_stop, stop coordinate calibration and turn RoArm torque on);
+
+static int armcal_exit_clear(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_armcal_exit_clear();
+}
+MSH_CMD_EXPORT(armcal_exit_clear, clear saved off-camera exit position);
+
+static int grab_start(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_grab_start();
+}
+MSH_CMD_EXPORT(grab_start, enable vision coordinate streaming and M33 grasping);
+
+static int grab_stop(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_grab_stop();
+}
+MSH_CMD_EXPORT(grab_stop, disable vision coordinate streaming and M33 grasping);
+
+static int place_unlock(int argc, char **argv)
+{
+    int category = (argc > 1) ? atoi(argv[1]) : 0;
+    return vision_ipc_place_unlock(category);
+}
+MSH_CMD_EXPORT(place_unlock, release torque before recording place point: place_unlock [category]);
+
+static int place_lock(int argc, char **argv)
+{
+    int category = (argc > 1) ? atoi(argv[1]) : 0;
+    return vision_ipc_place_lock(category);
+}
+MSH_CMD_EXPORT(place_lock, record current RoArm position as place point: place_lock [category]);
+
+static int place_clear(int argc, char **argv)
+{
+    int category = (argc > 1) ? atoi(argv[1]) : 0;
+    return vision_ipc_place_clear(category);
+}
+MSH_CMD_EXPORT(place_clear, clear saved place point: place_clear [category]);
+
+static int place_show(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return vision_ipc_place_show();
+}
+MSH_CMD_EXPORT(place_show, show saved place points);
+#endif /* FINSH_USING_MSH */
+
+void vision_ipc_try_send_result(const uvc_ai_result_t *result)
+{
+#ifdef BSP_USING_IPC
+    edge_rc_frame_t frame;
+    rt_tick_t now;
+    rt_tick_t interval_ticks;
+    int16_t x1, y1, x2, y2;
+    rt_uint16_t cx, cy;
+    rt_uint16_t score_x1000;
+    rt_uint8_t idx;
+
+    if (result == RT_NULL)
+    {
+        return;
+    }
+
+    if (!g_grab_stream_enabled)
+    {
+        return;
+    }
+
+    /* V2.4: verification is still informational, but the pending verify window
+     * also acts as the RoArm action cooldown. Do not send another coordinate
+     * while the previous 14s pick/place/exit window is still active.
+     */
+    vision_pick_verify_update(result);
+    if (g_pick_verify.pending)
+    {
+        return;
+    }
+
+    if ((!result->valid) || (result->count == 0U))
+    {
+        return;
+    }
+
+    idx = vision_pick_best_index(result);
+
+    now = rt_tick_get();
+    interval_ticks = (VISION_IPC_SEND_INTERVAL_MS * RT_TICK_PER_SECOND) / 1000U;
+
+    if ((g_vision_last_send_tick != 0U) &&
+        ((now - g_vision_last_send_tick) < interval_ticks))
+    {
+        return;
+    }
+
+    if (vision_ipc_open_once() != RT_EOK)
+    {
+        return;
+    }
+
+    {
+        rt_uint32_t area_unused;
+        vision_get_bbox_center(result, idx, &x1, &y1, &x2, &y2, &cx, &cy, &area_unused);
+    }
+    score_x1000 = conf_to_score_x1000(result->conf[idx]);
+
+    memset(&frame, 0, sizeof(frame));
+
+    frame.role = RC_ROLE_M55_ECHO;
+    frame.seq = ++g_vision_ipc_seq;
+
+    frame.channel[0] = VISION_IPC_MSG_PEN_COORD;
+    frame.channel[1] = cx;
+    frame.channel[2] = cy;
+    frame.channel[3] = clamp_u16_from_i16(x1);
+    frame.channel[4] = clamp_u16_from_i16(y1);
+    frame.channel[5] = clamp_u16_from_i16(x2);
+    frame.channel[6] = clamp_u16_from_i16(y2);
+    frame.channel[7] = vision_pack_score_category(score_x1000, result->class_id[idx]);
+
+    if (rt_device_write(g_vision_ipc_dev, 0, &frame, 1) == 1)
+    {
+        g_vision_last_send_tick = now;
+        g_last_pick_valid = 1U;
+        g_last_pick_cx = cx;
+        g_last_pick_cy = cy;
+        if (!g_pick_verify.pending)
+        {
+            vision_pick_verify_arm(result, idx, frame.seq);
+        }
+
+        rt_kprintf("[M55->M33] target %s category=%u cx=%u cy=%u bbox=[%u,%u,%u,%u] score=%u seq=%lu picker=v24_14s_blocking_verify\r\n",
+                   result->class_string[idx],
+                   (unsigned)result->class_id[idx],
+                   frame.channel[1],
+                   frame.channel[2],
+                   frame.channel[3],
+                   frame.channel[4],
+                   frame.channel[5],
+                   frame.channel[6],
+                   score_x1000,
+                   (unsigned long)frame.seq);
+    }
+    else
+    {
+        rt_kprintf("[M55 IPC] send failed\r\n");
+    }
+#else
+    (void)result;
+#endif
+}
